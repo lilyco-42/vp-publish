@@ -225,6 +225,23 @@ YouTube       我的YouTube  ✓ 就绪    约 30 天后过期
 **「只剩 2.0 天」这行是重点。** 多平台发布的失败，大多数不是上传那一刻才发生的，
 而是那个平台的 cookie 三天前就过期了。体检把这 10 分钟的排查提前到 3 秒。
 
+**还有一类失败是 cookie 治不好的**：光有 sau 不够的平台。体检会把它排在
+「未登录」前面 —— 因为登录一百次也发不出去：
+
+```
+B站           我的B站      ✗ 失效    缺 biliup；约 120 天后过期
+YouTube       我的YouTube  ✗ 失效    缺真 Chrome
+
+  ⚠ biliup（sau 会从 GitHub 自动下载它的二进制，所以需要能连上 GitHub）
+  ⚠ 真 Chrome（sau 的 YouTube 上传写死了 channel="chrome"，chromium 顶不上）
+```
+
+这两个依赖是**照着源码核出来的**，不是照文档抄的：
+B站 的 biliup 由 `uploader/bilibili_uploader/runtime.py` 从 GitHub Releases
+自动下载到 `~/.social-auto-upload/tools/biliup/<系统>-<架构>/`；
+YouTube 的 `uploader/youtube_uploader/main.py` 里三处 `launch()` 全写着
+`channel="chrome"`。JSON 输出里也有（`requires` / `missing` 两个字段）。
+
 ### 扫码登录网页（`login-web`）—— 推荐用这个
 
 扫码登录的死穴是**延迟**：二维码有时效（抖音实测**一分钟量级**就失效），
@@ -460,25 +477,36 @@ sau 升级了也不连累它。
 **这一环的坑见下面「踩过的坑」第 16 条**——早期版本因为捕获了输出，
 二维码被吞掉，用户在终端上什么都看不到。
 
-**各平台登录实测现状**（2026-09-27，把 sau 支持的 10 个平台逐个真跑一遍）：
+**各平台登录实测现状**（2026-09-27）
 
-| 平台 | 出码 | 结论 |
-|---|---|---|
-| 抖音 | ✅ 2 秒 | 终端/网页都能做 |
-| 微博 | ✅ 10 秒 | 同上 |
-| 支付宝生活号 | ✅ 24 秒 | 同上 |
-| 小红书 | ✅ | 码文件名是 `_xhs_login_qrcode` —— 曾被硬编后缀的 glob 漏掉（第 34 条坑） |
-| 快手 | ✅ | 同上，后缀 `_ks_login_qrcode` |
-| 虎扑 | ✅ | 同上，后缀 `_qq_qrcode` 且**没有时间戳** |
-| B站 | ❌ | 走 biliup，硬性要求真 tty，网页里注定做不成（第 35 条坑） |
-| 视频号 | ❌ | 登录页 3 个宣传 MP4 永不完成，`wait_until="load"` 等不到 → 渲染进程崩 |
-| 百家号 | ❌ | 点「登录」后百度 passport 的 iframe 崩（`Locator.wait_for: Target crashed`） |
-| YouTube | ❌ | sau 用 `channel="chrome"`，要求真 Chrome（`/opt/google/chrome/chrome`）；板子上只有 chromium |
+先说结论：**这 10 个平台在健康机器上全部可用**。下表是两轮实测合起来的 ——
+一轮在 Radxa 板子上（真 SBC），一轮在一台普通 x86 机器上（chromium 145）。
+两轮不一致的地方标出来了，那些是**那台板子自己的问题**，不是平台的问题。
 
-**TikTok 根本不在 sau 的 CLI 里**：`uploader/tk_uploader/` 的代码是有的，但
-`sau_cli.py` 里 `grep -i tiktok` 零命中（上游同样没接）。而且它的登录用的是
-`await page.pause()`（Playwright Inspector），**必须有人在图形界面里点「继续」**
-—— 无头设备上走不通。要接它得先重写一个无头登录。
+| 平台 | 普通机器 | 板子上 | 说明 |
+|---|---|---|---|
+| 抖音 | ✅ | ✅ 2 秒 | |
+| 微博 | ✅ | ✅ 10 秒 | |
+| 支付宝生活号 | ✅ | ✅ 24 秒 | |
+| 小红书 | ✅ | ✅ | 码文件名是 `_xhs_login_qrcode`（第 34 条坑） |
+| 快手 | ✅ | ✅ | 码文件名是 `_ks_login_qrcode` |
+| 虎扑 | ✅ | ✅ | 码文件名是 `_qq_qrcode`，**没有时间戳** |
+| 视频号 | ✅ | ❌ | 板子上渲染进程崩；同一份代码在普通机器上 1.3 秒出码 |
+| 百家号 | ✅ | ❌ | 板子上 `Target crashed`；普通机器正常出码 |
+| B站 | 要真终端 | 同左 | 走 biliup，硬性要求 `stdin/stdout` 都是 tty（第 35 条坑） |
+| YouTube | 要真 Chrome | 同左 | sau 写死了 `channel="chrome"`，chromium 顶不上 |
+
+> ⚠️ **板子上那两个失败不是平台的问题**。那台板子的 SD 卡在同期出现了 ext4
+> 元数据损坏（`bad block bitmap checksum`、`This should not happen!! Data will be lost`），
+> 文件被大面积写坏 —— 连系统 python 的 ELF 头都被写成了垃圾。
+> 也就是说，「这个平台不可用」这个结论**本身是被坏盘污染的**，
+> 必须换一台健康机器复核才作数。复核结果就是上表第一列。
+
+**TikTok 根本不在 sau 的 CLI 里**（实测：`sau tiktok` →
+`invalid choice: 'tiktok'`，可选值只有上面那 10 个）。
+`uploader/tk_uploader/` 的代码是有的，但它的登录用的是 `await page.pause()`
+（Playwright Inspector），**必须有人在图形界面里点「继续」**，无头设备上走不通。
+要接它得先重写一个无头登录 —— 这是上游的活，vp-publish 不替它造轮子。
 
 **端到端编排**（`--dry-run`，5 个平台）：2.1 秒，各平台 argv 逐个核对无误。
 
@@ -696,6 +724,28 @@ sau 升级了也不连累它。
     `--headless` **不是每个平台的 login 子命令都认**（bilibili 的只声明了
     `--account`，多给一个会被 argparse 当场打回），所以 argv 要按平台能力组装。
 
+36. **别在一台正在坏的机器上做诊断**。这一轮最大的教训。
+    板子的 SD 卡开始坏之后，我拿到的「平台不可用」结论里混进了大量假象：
+    视频号崩、百家号崩、缺 Chrome…… 换到一台普通机器上复核 ——
+    **同一份代码、同一个 commit**（`0012d2c`），那两个「崩」的平台
+    1 秒出头就正常出码了。
+
+    更要命的是当时的证据看起来非常扎实：崩溃日志、未完成的请求列表、
+    `--disable-gpu` 对照组…… **全都指向一个不存在的「上游 bug」**。
+    差点就照这个结论去给 sau 打补丁了。
+
+    根因是那台板子的根分区 ext4 块位图损坏了（`bad block bitmap checksum`），
+    分配器把已占用的块当空闲发出去，于是**写新文件会覆盖掉别人的数据** ——
+    连系统 python 的 ELF 头都被写成了 `c2 e7 a6 88`。
+
+    所以：**凡是「某个功能在这台机器上不工作」的判断，先确认机器本身完整**，
+    再下结论。三个便宜的哨兵：
+    · `dmesg -T | grep -iE 'EXT4-fs error|should not happen'`
+    · `tune2fs -l <根分区> | grep -iE 'state|error count'`
+    · `dpkg -V`（比官方包多出来的不一致项）
+    还有一个免费的：**用 git 当完整性检测器** ——
+    `git status` 里冒出你没改过的 modified 文件，基本就是盘坏了。
+
 ---
 
 ## 目录结构
@@ -720,7 +770,7 @@ vp-publish/
 │   ├── config.py              # 配置（零依赖 JSON）
 │   └── report.py              # 表格渲染（含中文宽度）
 └── tests/
-    ├── test_vp_publish.py     # 96 项单元测试
+    ├── test_vp_publish.py     # 104 项单元测试
     ├── e2e_watch.sh           # watch 跨轮行为演练（假 sau）
     ├── e2e_loginweb.sh        # 扫码网页演练（真 HTTP + 真 PNG）
     ├── reach_probe.py         # 实测各平台可达性
@@ -732,7 +782,7 @@ vp-publish/
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v   # 96 项单元测试
+python3 -m unittest discover -s tests -v   # 104 项单元测试
 bash tests/e2e_watch.sh                    # watch 跨轮行为演练（假 sau，几秒跑完）
 bash tests/e2e_loginweb.sh                 # 扫码网页演练（真起 HTTP 服务，约半分钟）
 ```
@@ -740,7 +790,9 @@ bash tests/e2e_loginweb.sh                 # 扫码网页演练（真起 HTTP �
 单元测试覆盖平台别名解析、argv 组装、元数据推导、标题裁剪、封面比例计算、
 账号发现、cookie 过期估算、中文表格对齐、状态幂等，以及二维码路径解析
 （防第 16/17 条坑回归，含**六种真实文件名**与「前缀放宽后仍然平台严格」，
-防第 34 条坑回归）、watch 的就绪判定/库存登记/无平台不记状态，
+防第 34 条坑回归）、watch 的就绪判定/库存登记/无平台不记状态、
+**平台额外依赖的判定**（biliup / 真 Chrome，防第 36 条坑那类
+「看着绿其实发不出去」回归），
 以及扫码网页的**平台严格匹配**、**零外部请求**、**换码/换平台时旧码的去留**、
 **注定做不成的平台要被拒**（第 35 条）、
 HTTP 令牌与路由（防第 28/29/30/32/33 条坑回归）。

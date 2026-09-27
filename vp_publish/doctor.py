@@ -40,9 +40,14 @@ class PlatformHealth:
     live_ok: bool | None = None
     live_note: str = ""
     extra_accounts: list[str] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)   # 还缺什么（biliup / 真 Chrome）
 
     @property
     def status(self) -> str:
+        # 「缺东西」排在「没登录」前面：登录再多次也发不出去，
+        # 而缺什么才是用户真正要动手的那件事。
+        if self.missing:
+            return report.FAIL
         if not self.logged_in:
             return report.SKIP
         if self.live_ok is False:
@@ -62,7 +67,75 @@ class Environment:
     browsers: list[str] = field(default_factory=list)
     proxy_ok: bool | None = None
     proxy: str = ""
+    biliup: Path | None = None      # B站 的后端，sau 会从 GitHub 自动下载
+    chrome: Path | None = None      # 真 Chrome（YouTube 只认它）
     warnings: list[str] = field(default_factory=list)
+
+
+# sau 把 biliup 下到 ~/.social-auto-upload/tools/biliup/<系统>-<架构>/biliup。
+# 这套路径规则是照着 uploader/bilibili_uploader/runtime.py 抄的 ——
+# 抄的原因是我们得在**不启动 sau** 的前提下判断它下没下下来。
+def _biliup_platform_key() -> str:
+    import platform as _p
+
+    system = (_p.system() or "").strip().lower()
+    if system == "darwin":
+        system = "macos"
+    machine = (_p.machine() or "").strip().lower()
+    machine = {"amd64": "x86_64", "x64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
+    return f"{system}-{machine}"
+
+
+def find_biliup() -> Path | None:
+    import platform as _p
+
+    exe = "biliup.exe" if _p.system().lower() == "windows" else "biliup"
+    path = Path.home() / ".social-auto-upload" / "tools" / "biliup" / _biliup_platform_key() / exe
+    return path if path.is_file() else None
+
+
+# 「真 Chrome」的标准落点。sau 用的是 playwright 的 channel="chrome"，
+# 它会自己去这些地方找；这里只是提前告诉用户「有没有」。
+CHROME_CANDIDATES = (
+    "/opt/google/chrome/chrome",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+)
+
+
+def find_chrome() -> Path | None:
+    import os
+    import shutil
+
+    for cand in CHROME_CANDIDATES:
+        p = Path(cand)
+        if p.is_file():
+            return p
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        p = Path(local) / "Google" / "Chrome" / "Application" / "chrome.exe"
+        if p.is_file():
+            return p
+    for name in ("google-chrome", "google-chrome-stable", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    return None
+
+
+def missing_requirements(plat: platforms.Platform, env: Environment) -> list[str]:
+    """这个平台还缺什么。返回的是**依赖 key**（biliup / chrome），
+    给人看的短标签和长解释都在 platforms.REQUIREMENT_* 里 ——
+    这样加新依赖只需要动 platforms.py 一处。
+    """
+    have = {
+        platforms.BILIUP: env.biliup is not None,
+        platforms.CHROME: env.chrome is not None,
+    }
+    return [req for req in plat.requires if not have.get(req, True)]
 
 
 def read_cookie_expiry(path: Path) -> tuple[float | None, str]:
@@ -130,6 +203,9 @@ def inspect_environment(cfg: Config, *, check_proxy: bool = False) -> Environmen
             f"（找过 {cache}）修：bash bootstrap.sh"
         )
 
+    env.biliup = find_biliup()
+    env.chrome = find_chrome()
+
     if check_proxy and cfg.proxy:
         env.proxy_ok = _probe_proxy(cfg.proxy)
         # 这里**不**加警告 —— 代理只有发 YouTube 才需要。
@@ -168,6 +244,7 @@ def inspect_platforms(cfg: Config, env: Environment, *,
         names = available.get(plat.key) or []
         account = sau.pick_account(cfg, plat.key, available)
         health = PlatformHealth(key=plat.key, label=plat.label, account=account)
+        health.missing = missing_requirements(plat, env)
 
         if names:
             health.logged_in = True
@@ -227,10 +304,11 @@ def render(cfg: Config, env: Environment, healths: list[PlatformHealth],
     # ── 平台 ────────────────────────────────────────────────
     rows = []
     for h in healths:
+        # 「缺什么」永远排在最前面 —— 它是唯一需要用户动手的事
+        bits = [platforms.REQUIREMENT_SHORT.get(k, k) for k in h.missing]
         if not h.logged_in:
-            note = "还没登录"
+            bits.append("还没登录")
         else:
-            bits = []
             if h.days_left is not None:
                 if h.days_left < 0:
                     bits.append("登录已过期")
@@ -242,7 +320,7 @@ def render(cfg: Config, env: Environment, healths: list[PlatformHealth],
                 bits.append(f"另有账号：{', '.join(h.extra_accounts)}")
             if h.live_note:
                 bits.append(h.live_note)
-            note = "；".join(bits)
+        note = "；".join(bits)
 
         # 体检里的 OK 是「可以发」，不是「已发布」——同一个状态码，两种语境
         label_text = {report.OK: "就绪", report.FAIL: "失效", report.SKIP: "未登录"}
@@ -258,6 +336,10 @@ def render(cfg: Config, env: Environment, healths: list[PlatformHealth],
         ("result", "状态", "left"),
         ("note", "说明", "left"),
     ]))
+
+    # 缺依赖比 cookie 过期更值得单独说清楚：它不是「去登录一下」能解决的
+    for req in sorted({r for h in healths for r in h.missing}):
+        warnings.append(platforms.REQUIREMENT_LABEL.get(req, req))
 
     ready = [h for h in healths if h.status == report.OK]
     lines.append("")
@@ -278,6 +360,8 @@ def to_dict(cfg: Config, env: Environment, healths: list[PlatformHealth]) -> dic
             "sau_problem": env.sau_problem,
             "ffmpeg": env.ffmpeg,
             "browsers": env.browsers,
+            "biliup": str(env.biliup) if env.biliup else None,
+            "chrome": str(env.chrome) if env.chrome else None,
             "proxy": env.proxy,
             "proxy_ok": env.proxy_ok,
             "warnings": env.warnings,
@@ -293,6 +377,9 @@ def to_dict(cfg: Config, env: Environment, healths: list[PlatformHealth]) -> dic
                 "live_ok": h.live_ok,
                 "live_note": h.live_note,
                 "extra_accounts": h.extra_accounts,
+                "requires": list(platforms.BY_KEY[h.key].requires)
+                            if h.key in platforms.BY_KEY else [],
+                "missing": h.missing,
             }
             for h in healths
         ],

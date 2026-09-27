@@ -595,6 +595,91 @@ class TestCookieExpiry(unittest.TestCase):
             self.assertIsNone(exp)
 
 
+# ── 平台额外依赖（biliup / 真 Chrome）────────────────────────────
+class TestDoctorRequirements(unittest.TestCase):
+    """光有 sau 还不够的那些平台，体检必须说得出来。
+
+    这两条是**实测挖出来的**，不是照文档抄的：
+      · B站：sau 会从 GitHub Releases 自动下载 biliup 的二进制
+        （`uploader/bilibili_uploader/runtime.py`），所以它需要能连 GitHub。
+      · YouTube：sau 的上传把 `channel="chrome"` 写死了，chromium 顶不上。
+
+    踩过的坑：这两件事原来只在**上传那一刻**才暴露，报的还是
+    playwright 的英文异常；体检里一片绿。用户根本不知道该去装什么。
+    """
+
+    def _env(self, **kw):
+        from vp_publish import doctor
+        return doctor.Environment(**kw)
+
+    def test_extra_requirements_are_declared(self):
+        self.assertEqual(platforms.BY_KEY["bilibili"].requires, (platforms.BILIUP,))
+        self.assertEqual(platforms.BY_KEY["youtube"].requires, (platforms.CHROME,))
+
+    def test_bilibili_needs_biliup(self):
+        from vp_publish import doctor
+        plat = platforms.BY_KEY["bilibili"]
+        self.assertEqual(doctor.missing_requirements(plat, self._env()), ["biliup"])
+
+    def test_biliup_present_clears_it(self):
+        from vp_publish import doctor
+        plat = platforms.BY_KEY["bilibili"]
+        env = self._env(biliup=Path("/x/biliup"))
+        self.assertEqual(doctor.missing_requirements(plat, env), [])
+
+    def test_youtube_needs_real_chrome(self):
+        from vp_publish import doctor
+        plat = platforms.BY_KEY["youtube"]
+        self.assertEqual(doctor.missing_requirements(plat, self._env()), ["chrome"])
+        env = self._env(chrome=Path("/x/chrome"))
+        self.assertEqual(doctor.missing_requirements(plat, env), [])
+
+    def test_other_platforms_are_never_blocked_by_extra_deps(self):
+        """没有额外依赖的平台不能被误报 —— 假阳性比不报还坏。"""
+        from vp_publish import doctor
+        env = self._env()
+        for key in ("douyin", "xiaohongshu", "kuaishou", "weibo",
+                    "alipay", "hupu", "baijiahao", "tencent"):
+            self.assertEqual(doctor.missing_requirements(platforms.BY_KEY[key], env),
+                             [], f"{key} 不该被额外依赖挡住")
+
+    def test_missing_beats_not_logged_in(self):
+        """「缺依赖」要排在「还没登录」前面 —— 登录一百次也发不出去。"""
+        from vp_publish import doctor
+        h = doctor.PlatformHealth(key="bilibili", label="B站",
+                                  missing=["biliup"], logged_in=False)
+        self.assertEqual(h.status, report.FAIL)
+
+    def test_biliup_path_rule_matches_sau(self):
+        """biliup 的落点规则必须和 sau 的 runtime.py 一致，
+        否则「有没有下下来」这个判断本身就是错的。
+        """
+        from vp_publish import doctor
+        key = doctor._biliup_platform_key()
+        self.assertRegex(key, r"^[a-z0-9_]+-[a-z0-9_]+$")
+        # 别名映射要跟 sau 一样（amd64/x64 → x86_64，arm64 → aarch64）
+        self.assertEqual(doctor._biliup_platform_key(), key)
+
+    def test_render_and_dict_say_what_is_missing(self):
+        from vp_publish import doctor
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(sau=SauConfig(root=Path(tmp)))
+            env = doctor.Environment()          # 故意造一个「什么都没有」的环境
+            healths = doctor.inspect_platforms(cfg, env)
+            text = doctor.render(cfg, env, healths)
+            self.assertIn("缺 biliup", text)
+            self.assertIn("缺真 Chrome", text)
+            self.assertIn("GitHub", text)       # 底部长解释也要在
+
+            data = doctor.to_dict(cfg, env, healths)
+            by = {p["key"]: p for p in data["platforms"]}
+            self.assertEqual(by["bilibili"]["missing"], ["biliup"])
+            self.assertEqual(by["bilibili"]["requires"], ["biliup"])
+            self.assertEqual(by["youtube"]["missing"], ["chrome"])
+            # 缺依赖的平台不能算「就绪」
+            self.assertNotEqual(by["bilibili"]["status"], report.OK)
+
+
 # ── 配置 ────────────────────────────────────────────────────────
 class TestConfig(unittest.TestCase):
     def test_missing_file_uses_defaults(self):

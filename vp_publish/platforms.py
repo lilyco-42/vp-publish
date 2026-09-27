@@ -23,6 +23,28 @@ VISIBILITY = "visibility"          # 支持可见性（YouTube）
 TID = "tid"                        # 必须传分区 id（B站）
 NOTE = "note"                      # 支持图文（本次只发视频，占位）
 
+# ── 平台之外的额外依赖 ──────────────────────────────────────────
+# 有些平台光有 sau 还不够。这两个是实测挖出来的，不是猜的：
+#   · B站：sau 会**从 GitHub Releases 自动下载** biliup 的 Rust 二进制到
+#     ~/.social-auto-upload/tools/biliup/<系统>-<架构>/biliup。
+#     也就是说 B站 的前提是「这台机器能连上 GitHub」——板子直连不通就永远下不下来。
+#   · YouTube：sau 的 youtube_uploader 把 channel="chrome" **写死了**
+#     （`playwright.chromium.launch(headless=True, channel="chrome")`），
+#     这是「必须是 Google 出的真 Chrome」，chromium 顶不上。
+BILIUP = "biliup"
+CHROME = "chrome"
+
+REQUIREMENT_LABEL: dict[str, str] = {
+    BILIUP: "biliup（sau 会从 GitHub 自动下载它的二进制，所以需要能连上 GitHub）",
+    CHROME: "真 Chrome（sau 的 YouTube 上传写死了 channel=\"chrome\"，chromium 顶不上）",
+}
+
+# 表格里那一列用短标签，长解释放到底部警告里
+REQUIREMENT_SHORT: dict[str, str] = {
+    BILIUP: "缺 biliup",
+    CHROME: "缺真 Chrome",
+}
+
 # 下面这些能力是**照着 sau_cli.py 的 argparse 逐个核出来的**，不是照抄文档——
 # 文档和实现对不上是常态。核对时间：2026-09-27。
 # 核对方法：grep -n "add_argument" sau_cli.py，逐平台比对。
@@ -50,6 +72,8 @@ class Platform:
     login: str = "qr"
     accepts_headless: bool = True  # login 子命令认不认 --headless / --headed
     needs_proxy: bool = False      # 是否需要走代理才能连上
+    # 光有 sau 还不够，这个平台额外需要什么（见上面 BILIUP / CHROME）
+    requires: tuple[str, ...] = ()
     note: str = ""                 # 给人看的补充说明
 
 
@@ -75,6 +99,7 @@ PLATFORMS: tuple[Platform, ...] = (
         caps=frozenset({COVER, SCHEDULE, TID}),
         login="terminal",          # biliup 要真终端，网页里做不了
         accepts_headless=False,    # login 子命令只认 --account
+        requires=(BILIUP,),        # sau 会从 GitHub 下 biliup 二进制
         note="必须指定分区（--tid），默认 171=科技·人工智能；"
              "登录要在真终端里跑（sau 用的 biliup 要求 tty）",
     ),
@@ -115,6 +140,7 @@ PLATFORMS: tuple[Platform, ...] = (
         caps=frozenset({COVER, PLAYLIST, VISIBILITY}),
         login="browser",
         needs_proxy=True,
+        requires=(CHROME,),        # sau 写死了 channel="chrome"
         note="标题上限 100 字；走 Google 账号登录（非扫码）；必须挂代理",
     ),
 )
