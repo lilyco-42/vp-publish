@@ -202,6 +202,19 @@ class Hub:
             # 「没找到 sau」这种驴唇不对马嘴的提示，排查时会被带偏。
             if key not in platforms.BY_KEY:
                 return {"ok": False, "error": f"认不出平台：{key}"}
+            plat = platforms.BY_KEY[key]
+            # 有些平台的登录**在网页里注定做不成**（bilibili 走 biliup，
+            # 硬性要求 sys.stdin/stdout 都是 tty）。与其让用户点一个必然失败的
+            # 按钮，不如直接说清楚该怎么办 —— 这是本工具的一条硬规矩。
+            if plat.login == "terminal":
+                acct = sau.resolve_account(self.cfg, key, override=account)
+                return {"ok": False, "error": (
+                    f"{plat.label} 的登录必须在**真终端**里跑"
+                    f"（sau 底层用的 biliup 要求 tty，网页给不了）。\n"
+                    f"  在这台机器上执行：\n"
+                    f"    cd ~/vp-publish && ./vp-publish login {key} "
+                    f"--account {acct}\n"
+                    f"  二维码会打印在终端里，也会存成图片。")}
             if self.sau_path is None:
                 return {"ok": False, "error": self.problem}
             # 同一个平台重开 = 换一张码 → 旧码继续挂着，别让页面空十几秒。
@@ -398,6 +411,9 @@ PAGE = r"""<!doctype html>
      background:#fff;cursor:pointer;text-align:left}
   .p:hover{border-color:#c8ccd2}
   .p.on{border-color:var(--brand);box-shadow:0 0 0 2px rgba(47,111,237,.14)}
+  /* 网页里注定做不成的平台：画成不可点，别让人白点一次 */
+  .p.off{opacity:.5;cursor:not-allowed}
+  .p.off:hover{border-color:var(--line)}
   .p .n{font-weight:600}
   .p .t{font-size:12px;color:var(--dim);margin-top:1px}
   .badge{font-size:12px;padding:2px 8px;border-radius:99px;border:1px solid var(--line);
@@ -488,9 +504,12 @@ PAGE = r"""<!doctype html>
     var want = st.platforms.map(function(p){
       var acct = (st.accounts || {})[p.key];
       var on = p.key === st.platform;
-      var extra = p.key === "hupu" ? "浏览器里输账号" :
+      var term = p.login === "terminal";        // 网页里做不成，只能真终端
+      var extra = term ? "要在终端里跑" :
+                  p.key === "hupu" ? "浏览器里输账号" :
                   (p.needs_proxy ? "需要代理" : "手机扫码");
-      return '<button class="p' + (on ? " on" : "") + '" data-k="' + p.key + '">' +
+      return '<button class="p' + (on ? " on" : "") + (term ? " off" : "") +
+             '" data-k="' + p.key + '"' + (term ? " disabled" : "") + '>' +
              '<span><span class="n">' + p.label + '</span>' +
              '<div class="t">' + extra + '</div></span>' +
              '<span class="badge ' + (acct ? "yes" : "no") + '">' +
@@ -498,7 +517,10 @@ PAGE = r"""<!doctype html>
     }).join("");
     if (want !== logged) { wrap.innerHTML = want; logged = want;
       Array.prototype.forEach.call(wrap.querySelectorAll(".p"), function(el){
-        el.onclick = function(){ begin(el.getAttribute("data-k")); };
+        el.onclick = function(){
+          if (el.disabled) { return; }
+          begin(el.getAttribute("data-k"));
+        };
       });
     }
 

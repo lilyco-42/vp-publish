@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shutil
@@ -184,8 +185,17 @@ def build_check_argv(sau: Path, plat_key: str, account: str) -> list[str]:
 
 def build_login_argv(sau: Path, plat_key: str, account: str,
                      *, headless: bool = True) -> list[str]:
+    """组装登录命令。
+
+    `--headless/--headed` **不是每个平台都认** —— 实测 bilibili 的 login
+    子命令只声明了 `--account`，多给一个 `--headless` 会被 argparse 当场
+    打回（`unrecognized arguments: --headless`），连登录流程都进不去。
+    所以这里按平台能力决定要不要带这个参数。
+    """
     argv = [str(sau), plat_key, "login", "--account", account]
-    argv += ["--headless" if headless else "--headed"]
+    plat = platforms.BY_KEY.get(plat_key)
+    if plat is None or plat.accepts_headless:
+        argv += ["--headless" if headless else "--headed"]
     return argv
 
 
@@ -306,17 +316,32 @@ def login(sau: Path, plat_key: str, account: str, cfg: Config,
 
 
 def qr_glob(cfg: Config, plat_key: str, account: str) -> str:
-    """sau 保存二维码的实际命名规则。
+    """sau 保存二维码的命名规则 —— **各平台并不统一**。
 
-    来自 sau 的 utils/login_qrcode.py:
-        build_login_qrcode_path(account_file) ->
-            {account_file 同目录}/{stem}_login_qrcode_{YYYYmmdd_HHMMSS}.png
-    其中 account_file = {BASE_DIR}/cookies/{platform}_{account}.json
+    实测（2026-09-27，把每个平台的登录真跑一遍）拿到的真实文件名：
 
-    → 所以真实路径是 cookies/{platform}_{account}_login_qrcode_*.png
-    注意是**带时间戳**的：重试一次会多一个文件，所以要用 glob 取最新的。
+        douyin        douyin_我的抖音_login_qrcode_20260927_142027.png
+        weibo         weibo_我的微博_login_qrcode_20260927_142255.png
+        alipay        alipay_我的支付宝生活号_login_qrcode_20260927_142333.png
+        xiaohongshu   xiaohongshu_我的小红书_xhs_login_qrcode_....png   ← 多个 _xhs
+        kuaishou      kuaishou_我的快手_ks_login_qrcode_....png         ← 多个 _ks
+        hupu          hupu_我的虎扑_qq_qrcode.png                       ← 连时间戳都没有
+
+    规律只有「{platform}_{account} 开头 + 名字里有 qrcode + .png」这一条。
+    后缀各写各的，是因为 sau 的 build_login_qrcode_path 支持自定义 suffix
+    （抖音/微博/支付宝用默认值，小红书传 xhs_login_qrcode，快手传
+    ks_login_qrcode），hupu 干脆自己拼了个 _qq_qrcode。
+
+    所以这里**按前缀匹配**，不硬编后缀。硬编的后果就是小红书/快手/虎扑
+    三个平台**静默失效** —— 网页上显示「没有二维码」，其实码就躺在
+    cookies 目录里（这是实测抓到的，单测发现不了）。
+
+    注意仍然是**平台严格**的：前缀里带着 platform 和 account，
+    捞不到别的平台的图 —— 那才是真正致命的（扫了登不上，且零报错）。
     """
-    return str(cfg.sau.cookies_dir / f"{plat_key}_{account}_login_qrcode_*.png")
+    # 前缀要转义：账号名里如果碰巧有 * ? [ 之类的字符，glob 会当成通配符
+    prefix = glob.escape(str(cfg.sau.cookies_dir / f"{plat_key}_{account}"))
+    return f"{prefix}*qrcode*.png"
 
 
 def newest_qr(cfg: Config, plat_key: str, account: str, since: float) -> Path | None:

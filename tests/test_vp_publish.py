@@ -182,6 +182,22 @@ class TestBuildArgv(unittest.TestCase):
         self.assertIn("--tid", self.argv("bilibili"))
         self.assertIn("171", self.argv("bilibili"))
 
+    def test_login_argv_skips_headless_for_bilibili(self):
+        """bilibili 的 login 子命令不认 --headless，多给它会被 argparse 打回。
+
+        实测：`sau: error: unrecognized arguments: --headless`，
+        连登录流程都进不去。所以按平台能力决定带不带这个参数。
+        """
+        b = sau.build_login_argv(self.sau, "bilibili", "我的B站")
+        self.assertNotIn("--headless", b)
+        self.assertNotIn("--headed", b)
+        self.assertEqual(b[1:4], ["bilibili", "login", "--account"])
+        # 别的平台照旧
+        d = sau.build_login_argv(self.sau, "douyin", "我的抖音")
+        self.assertIn("--headless", d)
+        self.assertIn("--headed",
+                      sau.build_login_argv(self.sau, "douyin", "x", headless=False))
+
     def test_tid_override_from_meta(self):
         m = meta.Meta(title="t", desc="d", tid=249)
         a = self.argv("bilibili", m=m)
@@ -318,6 +334,82 @@ class TestLoginQrPath(unittest.TestCase):
             hits = glob.glob(pattern)
             self.assertEqual(len(hits), 1)
             self.assertIn("login_qrcode_20260927_131500", hits[0])
+
+    def test_glob_matches_every_real_filename_pattern(self):
+        """各平台二维码文件名**不统一**，glob 必须都能认出来。
+
+        下面这些文件名不是编的，是把每个平台的登录真跑一遍之后
+        从 sau 的日志里抄下来的（2026-09-27）。原来按
+        `{platform}_{account}_login_qrcode_*.png` 硬编，结果
+        小红书/快手/虎扑三个平台**静默失效** —— 网页上显示「没有二维码」，
+        其实码就躺在 cookies 目录里。这种问题单测不写就发现不了，
+        因为它不报错，只是"没有码"。
+        """
+        import glob
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(sau=SauConfig(root=Path(tmp)))
+            cookies = cfg.sau.cookies_dir
+            cookies.mkdir()
+            real = {
+                "douyin": ("我的抖音", "douyin_我的抖音_login_qrcode_20260927_142027.png"),
+                "weibo": ("我的微博", "weibo_我的微博_login_qrcode_20260927_142255.png"),
+                "alipay": ("我的支付宝生活号",
+                           "alipay_我的支付宝生活号_login_qrcode_20260927_142333.png"),
+                # ↓ 后缀多一截（sau 传了自定义 suffix）
+                "xiaohongshu": ("我的小红书",
+                                "xiaohongshu_我的小红书_xhs_login_qrcode_20260927_142037.png"),
+                "kuaishou": ("我的快手",
+                             "kuaishou_我的快手_ks_login_qrcode_20260927_142145.png"),
+                # ↓ 连时间戳都没有
+                "hupu": ("我的虎扑", "hupu_我的虎扑_qq_qrcode.png"),
+            }
+            for _, (_, name) in real.items():
+                (cookies / name).write_bytes(b"x")
+
+            for key, (acct, name) in real.items():
+                hits = glob.glob(sau.qr_glob(cfg, key, acct))
+                self.assertEqual(
+                    [Path(h).name for h in hits], [name],
+                    f"{key} 的二维码认不出来（实际文件名是 {name}）")
+
+    def test_glob_stays_platform_strict(self):
+        """放宽成前缀匹配之后，绝不能捞到别的平台的码。
+
+        放宽和「平台严格」是一对张力：这条就是那个张力点的哨兵。
+        """
+        import glob
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(sau=SauConfig(root=Path(tmp)))
+            cookies = cfg.sau.cookies_dir
+            cookies.mkdir()
+            (cookies / "douyin_我的抖音_login_qrcode_20260927_142027.png").write_bytes(b"a")
+            (cookies / "xiaohongshu_我的小红书_xhs_login_qrcode_20260927_142037.png").write_bytes(b"b")
+            # 名字里都带 douyin / qrcode，但不是这个平台的
+            (cookies / "bilibili_douyin_qrcode.png").write_bytes(b"c")
+
+            hits = [Path(h).name for h in glob.glob(sau.qr_glob(cfg, "douyin", "我的抖音"))]
+            self.assertEqual(hits, ["douyin_我的抖音_login_qrcode_20260927_142027.png"])
+
+    def test_glob_escapes_metacharacters_in_account(self):
+        """账号名里如果有 glob 通配符，不能把别的文件捞进来。
+
+        用 `[` 而不是 `*`：Windows 上文件名里不许出现 `*`，而 `[` 两边都合法
+        且同样是 glob 元字符。
+        """
+        import glob
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(sau=SauConfig(root=Path(tmp)))
+            cookies = cfg.sau.cookies_dir
+            cookies.mkdir()
+            # 真的那张：账号名里带一对中括号
+            (cookies / "douyin_我的[抖音]_login_qrcode_1.png").write_bytes(b"a")
+            # 陷阱：如果不转义，`[抖音]` 会被当成字符类，只吃一个字 ——
+            # 于是匹配到这个、反而漏掉真的那张
+            (cookies / "douyin_我的抖_login_qrcode_2.png").write_bytes(b"b")
+
+            hits = [Path(h).name
+                    for h in glob.glob(sau.qr_glob(cfg, "douyin", "我的[抖音]"))]
+            self.assertEqual(hits, ["douyin_我的[抖音]_login_qrcode_1.png"])
 
     def test_newest_qr_picks_latest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -980,8 +1072,11 @@ class TestLoginWeb(unittest.TestCase):
     def test_switching_platform_clears_old_qr(self):
         """换平台**绝不能**留着上一个平台的码。
 
-        否则页面显示着抖音的二维码，实际在登 B 站 —— 扫了就是登不上，
+        否则页面显示着抖音的二维码，实际在登小红书 —— 扫了就是登不上，
         而且零报错。这是本模块最危险的一个坑。
+
+        （用小红书而不是 B站：B站 现在会被「必须真终端」挡在前面，
+        测不到这里的换码逻辑。）
         """
         from vp_publish import loginweb
         hub = self._hub()
@@ -990,8 +1085,8 @@ class TestLoginWeb(unittest.TestCase):
         hub.session.qr_path = self._qr("douyin", "我的抖音")
         hub.session.qr_mtime = 123.0
         try:
-            out = hub.start("bilibili")
-            self.assertTrue(out["ok"])
+            out = hub.start("xiaohongshu")
+            self.assertTrue(out["ok"], out.get("error"))
             self.assertFalse(out["reused"])
             self.assertIsNone(hub.session.qr_path, "旧平台的码被留下来了！")
             self.assertEqual(hub.session.qr_mtime, 0.0)
@@ -1011,6 +1106,20 @@ class TestLoginWeb(unittest.TestCase):
         # 判断依据必须是服务端给的 qr_age，不能靠页面自己数秒
         self.assertIn("qr_age", page)
         self.assertIn("classList", page)
+
+    def test_start_refuses_platforms_that_need_a_real_terminal(self):
+        """网页里注定做不成的平台，要说清楚该怎么办，而不是让人白点一次。
+
+        bilibili 走 biliup，硬性要求 sys.stdin/stdout 都是 tty，
+        而网页起子进程时 stdin 是 DEVNULL —— 永远不可能成。
+        """
+        from vp_publish import loginweb
+        hub = self._hub()
+        out = hub.start("bilibili")
+        self.assertFalse(out["ok"])
+        self.assertIn("真终端", out["error"])
+        self.assertIn("vp-publish login bilibili", out["error"])
+        self.assertIsNone(hub.session.proc, "不该真的去拉进程")
 
     def test_http_token_and_routes(self):
         """没 token 的 API 请求要被挡住；页面本身要能打开。"""

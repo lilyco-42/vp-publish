@@ -32,6 +32,9 @@ NOTE = "note"                      # 支持图文（本次只发视频，占位�
 #   · hupu 既没有 --schedule 也没有 --collection
 #   · weibo / alipay 有 --collection 但**没有** --schedule
 #   · douyin / tencent 同时支持 --thumbnail-landscape 和 --thumbnail-portrait
+#   · **bilibili 的 login 子命令只认 --account**，多给一个 --headless 会被
+#     argparse 直接打回（`unrecognized arguments: --headless`），
+#     而且它要求 sys.stdin/stdout 都是 tty —— 也就是说**扫码网页做不了它**。
 
 
 @dataclass(frozen=True)
@@ -42,7 +45,10 @@ class Platform:
     title_min: int = 0             # 标题下限
     tags_max: int | None = None    # 标签个数上限
     caps: frozenset[str] = field(default_factory=frozenset)
-    login: str = "qr"              # qr=扫码；browser=浏览器里输账号
+    # qr=扫码（网页里能用）；browser=浏览器里输账号（网页里能起，但得有人操作）；
+    # terminal=**必须在真终端里跑**（bilibili），网页里点了也是白点
+    login: str = "qr"
+    accepts_headless: bool = True  # login 子命令认不认 --headless / --headed
     needs_proxy: bool = False      # 是否需要走代理才能连上
     note: str = ""                 # 给人看的补充说明
 
@@ -67,8 +73,10 @@ PLATFORMS: tuple[Platform, ...] = (
     Platform(
         key="bilibili", label="B站",
         caps=frozenset({COVER, SCHEDULE, TID}),
-        login="qr",
-        note="必须指定分区（--tid），默认 171=科技·人工智能",
+        login="terminal",          # biliup 要真终端，网页里做不了
+        accepts_headless=False,    # login 子命令只认 --account
+        note="必须指定分区（--tid），默认 171=科技·人工智能；"
+             "登录要在真终端里跑（sau 用的 biliup 要求 tty）",
     ),
     Platform(
         key="tencent", label="视频号",

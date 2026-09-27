@@ -762,7 +762,12 @@ def cmd_login(args, cfg: config_mod.Config) -> int:
     before = acct_file.stat().st_mtime if acct_file.is_file() else 0.0
 
     say(f"登录 {plat.label}（{key}），账号名：{account}")
-    say(f"  方式：{'浏览器里输账号' if plat.login == 'browser' else '手机扫码'}")
+    how = {"qr": "手机扫码", "browser": "浏览器里输账号",
+           "terminal": "真终端里的交互式登录"}.get(plat.login, plat.login)
+    say(f"  方式：{how}")
+    if plat.login == "terminal":
+        say("  · 这个平台必须在这个终端里跑（sau 底层要求 tty），"
+            "二维码会打印在下面")
     if plat.login == "browser" and not args.headed:
         say("  · 这个平台要在浏览器里操作，建议加 --headed 看得到窗口")
     say("  · sau 会把二维码直接打印在下面（没有的话看最后打印的图片路径）")

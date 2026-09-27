@@ -58,9 +58,16 @@ case "$1" in
     # 用标记文件而不是环境变量控制「这次不出码」：服务进程的环境在
     # 它启动那一刻就固定了，之后再 export 是传不进去的。
     if [ ! -f "$FAKE_COOKIES/.noqr" ]; then
-      ts="$(date +%Y%m%d_%H%M%S)"
+      # 各平台的二维码文件名**后缀不一样**（实测抄下来的），
+      # 假 sau 必须照着来 —— 不然演练就测不到「认不出小红书/快手的码」这个坑。
+      case "$plat" in
+        xiaohongshu) sfx="xhs_login_qrcode"; stamp="_$(date +%Y%m%d_%H%M%S)";;
+        kuaishou)    sfx="ks_login_qrcode";  stamp="_$(date +%Y%m%d_%H%M%S)";;
+        hupu)        sfx="qq_qrcode";        stamp="";;   # 虎扑连时间戳都没有
+        *)           sfx="login_qrcode";     stamp="_$(date +%Y%m%d_%H%M%S)";;
+      esac
       "$FAKE_PY" "$FAKE_PNG" "$plat" "$acct" \
-        "$FAKE_COOKIES/${plat}_${acct}_login_qrcode_${ts}.png"
+        "$FAKE_COOKIES/${plat}_${acct}_${sfx}${stamp}.png"
     fi
     # 真 sau 会把二维码用方块字符打到终端。我们的日志里必须把它清掉，
     # 否则日志区被几千个方块刷满，真出错了反而看不见。
@@ -211,14 +218,14 @@ else bad "换码期间旧码被清掉了（HTTP $CODE）"; fi
 
 # ── 5c. 换平台：绝不能留上一张 ──────────────────────────────────
 note "5c. 换平台时，上一张码必须清掉"
-rm -f "$BASE/sau/cookies/bilibili_我的B站_login_qrcode_"*.png
+rm -f "$BASE/sau/cookies/xiaohongshu_我的小红书_xhs_login_qrcode_"*.png
 : > "$BASE/sau/cookies/.noqr"          # 让假 sau 这次不出码
-curl -sS -X POST --data 'bilibili' "$U/api/start" -o "$BASE/re2.json"
+curl -sS -X POST --data 'xiaohongshu' "$U/api/start" -o "$BASE/re2.json"
 if grep -q '"reused": *false' "$BASE/re2.json"; then ok "认得出这是换平台"
 else bad "把换平台当成换码了：$(cat "$BASE/re2.json")"; fi
 CODE="$(curl -sS -o "$BASE/got4.png" -w '%{http_code}' "$U/api/qr.png")"
-if [ "$CODE" = 404 ]; then ok "抖音的码没被留下来给 B 站用"
-else bad "把抖音的码递给了 B 站（HTTP $CODE）—— 扫了就是登不上！"; fi
+if [ "$CODE" = 404 ]; then ok "抖音的码没被留下来给小红书用"
+else bad "把抖音的码递给了小红书（HTTP $CODE）—— 扫了就是登不上！"; fi
 ST="$(curl -fsS "$U/api/state")"
 if echo "$ST" | grep -q '"qr_mtime": *0'; then ok "本平台没码时就说没码，不拿别人的凑"
 else bad "没码却报有码：$(echo "$ST" | head -c 200)"; fi
@@ -229,9 +236,34 @@ else bad "没码却报有码：$(echo "$ST" | head -c 200)"; fi
   "$BASE/sau/cookies/douyin_我的抖音_login_qrcode_$(date +%Y%m%d_%H%M%S).png"
 sleep 0.5
 CODE="$(curl -sS -o "$BASE/got5.png" -w '%{http_code}' "$U/api/qr.png")"
-if [ "$CODE" = 404 ]; then ok "刚生成的抖音码也没被 B 站捡走"
-else bad "B 站捡了抖音的码（HTTP $CODE）"; fi
+if [ "$CODE" = 404 ]; then ok "刚生成的抖音码也没被小红书捡走"
+else bad "小红书捡了抖音的码（HTTP $CODE）"; fi
 rm -f "$BASE/sau/cookies/.noqr"
+
+# ── 5d. 各平台二维码文件名后缀不一样，都得认得出来 ──────────────
+note "5d. 小红书/快手/虎扑的码文件名后缀跟抖音不一样，也要认得出来"
+# 实测抄下来的真实文件名：xiaohongshu_..._xhs_login_qrcode_...png、
+# kuaishou_..._ks_login_qrcode_...png、hupu_..._qq_qrcode.png（连时间戳都没有）。
+# 原来按 {platform}_{account}_login_qrcode_*.png 硬编 → 这三个平台
+# **静默失效**（网页上显示「没有二维码」，其实码就在那儿）。假 sau 现在
+# 按各平台真实后缀出码，所以这一段能真的守住它。
+for spec in "xiaohongshu:我的小红书:xhs_login_qrcode" \
+            "kuaishou:我的快手:ks_login_qrcode" \
+            "hupu:我的虎扑:qq_qrcode"; do
+  PLAT="${spec%%:*}"; REST="${spec#*:}"; ACCT="${REST%%:*}"
+  curl -sS -X POST --data "$PLAT" "$U/api/start" >/dev/null
+  FOUND=0
+  for _ in $(seq 1 40); do
+    sleep 0.25
+    ST="$(curl -fsS "$U/api/state")"
+    echo "$ST" | grep -q '"qr_mtime": *[1-9]' && { FOUND=1; break; }
+  done
+  if [ "$FOUND" = 1 ] && [ "$(curl -sS -o "$BASE/got6.png" -w '%{http_code}' "$U/api/qr.png")" = 200 ]; then
+    ok "$PLAT 的码认得出来（$ACCT）"
+  else
+    bad "$PLAT 的码认不出来 —— 页面会显示「没有二维码」"
+  fi
+done
 
 # ── 6. 日志里的方块要被清掉 ─────────────────────────────────────
 note "6. 日志区不该被终端二维码刷满"
