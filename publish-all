@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# publish-all —— vp-publish 的别名。
+#
+# 存在的理由：「一键上传视频到各个平台」这句话，最顺手的命令名就是 publish-all。
+# 实际逻辑全在 vp-publish 里，这里只做转发，不复制代码。
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$HERE/vp-publish" "$@"

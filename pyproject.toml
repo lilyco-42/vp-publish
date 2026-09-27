@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vp-publish"
+version = "0.1.0"
+description = "一键上传视频到各个平台（抖音/小红书/快手/B站/视频号/微博/虎扑/百家号/支付宝/YouTube）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# 故意**零运行时依赖**：本工具是编排层，真正干活的是 social-auto-upload。
+# 不引入 PyYAML 之类，是为了让它用系统 python3 就能跑——
+# 它坏了不连累 sau，sau 升级了也不连累它。
+dependencies = []
+
+[project.scripts]
+vp-publish = "vp_publish.cli:main"
+publish-all = "vp_publish.cli:main"
+
+[tool.setuptools]
+packages = ["vp_publish"]

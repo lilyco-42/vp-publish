@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 是 pyproject 里声明的下限；3.13 是板子上实际跑的版本。
+        # 两个都测，避免「本地能跑板子上不能跑」。
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 语法检查（编译所有模块）
+        run: python -m compileall -q vp_publish
+
+      - name: shell 脚本语法检查
+        run: |
+          bash -n bootstrap.sh
+          bash -n publish-all
+
+      - name: 单元测试
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: 冒烟测试（零依赖路径，不碰网络）
+        run: |
+          python -m vp_publish platforms
+          python -m vp_publish --help
+          python -m vp_publish doctor --no-proxy-check || true
+          python -m vp_publish accounts || true
+
+      - name: 检查有没有误提交凭据
+        run: |
+          set -e
+          # 这些文件绝不该出现在仓库里
+          if git ls-files | grep -E '(^|/)(cookies|conf\.py|cookies\.json)$'; then
+            echo "::error::仓库里出现了凭据文件！"
+            exit 1
+          fi
+          # 粗查私钥/长 token 字面量
+          if git grep -nE 'BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY' -- . ; then
+            echo "::error::仓库里出现了私钥！"
+            exit 1
+          fi
+          echo "凭据检查通过"

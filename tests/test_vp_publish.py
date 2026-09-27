@@ -1,0 +1,470 @@
+"""vp-publish 单元测试。
+
+跑法（不需要装任何东西，stdlib unittest）：
+    python3 -m unittest discover -s tests -v
+
+覆盖重点：**平台适配逻辑**。上传本身要靠人扫码，测不了；
+但「给 B站 有没有带 --tid」「给虎扑有没有错误地塞 --schedule」
+这类事完全可测，而且正是最容易写错的地方。
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from vp_publish import cover, meta, platforms, report, sau, state   # noqa: E402
+from vp_publish.config import Config, SauConfig                     # noqa: E402
+
+
+# ── 平台 ────────────────────────────────────────────────────────
+class TestPlatforms(unittest.TestCase):
+    def test_keys_unique(self):
+        keys = [p.key for p in platforms.PLATFORMS]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_alias_resolution(self):
+        for written, expected in [
+            ("抖音", "douyin"), ("dy", "douyin"),
+            ("b站", "bilibili"), ("B站", "bilibili"), ("bili", "bilibili"),
+            ("小红书", "xiaohongshu"), ("xhs", "xiaohongshu"),
+            ("油管", "youtube"), ("yt", "youtube"),
+            ("视频号", "tencent"), ("虎扑", "hupu"),
+        ]:
+            with self.subTest(written=written):
+                self.assertEqual(platforms.resolve(written), expected)
+
+    def test_resolve_unknown(self):
+        self.assertIsNone(platforms.resolve("tiktok"))
+        self.assertIsNone(platforms.resolve(""))
+
+    def test_parse_list_reports_bad(self):
+        good, bad = platforms.parse_list("douyin, 抖音, tiktok, 不存在")
+        self.assertEqual(good, ["douyin"])          # 抖音 是 douyin 的别名，去重
+        self.assertEqual(bad, ["tiktok", "不存在"])
+
+    def test_parse_list_chinese_comma(self):
+        good, bad = platforms.parse_list("抖音，小红书")
+        self.assertEqual(good, ["douyin", "xiaohongshu"])
+        self.assertEqual(bad, [])
+
+    def test_ordered_follows_declaration(self):
+        # 传入顺序打乱，输出应按 PLATFORMS 的顺序
+        self.assertEqual(platforms.ordered(["youtube", "douyin", "bilibili"]),
+                         ["douyin", "bilibili", "youtube"])
+
+    def test_bilibili_requires_tid_and_weibo_has_limit(self):
+        self.assertIn(platforms.TID, platforms.BY_KEY["bilibili"].caps)
+        self.assertEqual(platforms.BY_KEY["weibo"].title_max, 30)
+
+    def test_hupu_has_no_schedule(self):
+        # 这条是从 sau_cli.py 的 argparse 核出来的：虎扑没有 --schedule
+        self.assertNotIn(platforms.SCHEDULE, platforms.BY_KEY["hupu"].caps)
+        self.assertNotIn(platforms.COLLECTION, platforms.BY_KEY["hupu"].caps)
+
+
+# ── 元数据 ──────────────────────────────────────────────────────
+class TestMeta(unittest.TestCase):
+    def test_split_tags_variants(self):
+        self.assertEqual(meta.split_tags("a,b,c"), ["a", "b", "c"])
+        self.assertEqual(meta.split_tags("a，b、c"), ["a", "b", "c"])
+        self.assertEqual(meta.split_tags("#a #b"), ["a", "b"])
+        self.assertEqual(meta.split_tags(["a", "a", "b"]), ["a", "b"])
+        self.assertEqual(meta.split_tags(None), [])
+
+    def test_filename_fallback_strips_noise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "20260927-AI视频生成-final.mp4"
+            video.write_bytes(b"x")
+            m = meta.load(video)
+            self.assertNotIn("20260927", m.title)
+            self.assertNotIn("final", m.title)
+            self.assertIn("AI", m.title)
+
+    def test_sidecar_json_wins_over_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "final.mp4"
+            video.write_bytes(b"x")
+            (Path(tmp) / "final.json").write_text(
+                json.dumps({"title": "真标题", "desc": "简介",
+                            "tags": ["AI", "科技"], "tid": 249}),
+                encoding="utf-8")
+            m = meta.load(video)
+            self.assertEqual(m.title, "真标题")
+            self.assertEqual(m.desc, "简介")
+            self.assertEqual(m.tags, ["AI", "科技"])
+            self.assertEqual(m.tid, 249)
+
+    def test_meta_json_convention(self):
+        # vp-pipeline 的约定：同目录 meta.json
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "final.mp4"
+            video.write_bytes(b"x")
+            (Path(tmp) / "meta.json").write_text(
+                json.dumps({"title": "来自meta.json"}), encoding="utf-8")
+            self.assertEqual(meta.load(video).title, "来自meta.json")
+
+    def test_cli_overrides_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "final.mp4"
+            video.write_bytes(b"x")
+            (Path(tmp) / "final.json").write_text(
+                json.dumps({"title": "文件标题"}), encoding="utf-8")
+            self.assertEqual(meta.load(video, title="命令行标题").title, "命令行标题")
+
+    def test_txt_first_line_is_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "final.mp4"
+            video.write_bytes(b"x")
+            (Path(tmp) / "final.txt").write_text("标题行\n简介第一行\n简介第二行",
+                                                 encoding="utf-8")
+            m = meta.load(video)
+            self.assertEqual(m.title, "标题行")
+            self.assertIn("简介第二行", m.desc)
+
+    def test_adapt_title_truncates_weibo(self):
+        plat = platforms.BY_KEY["weibo"]           # 上限 30
+        long_title = "啊" * 50
+        out, warns = meta.adapt_title(long_title, plat)
+        self.assertLessEqual(len(out), 30)
+        self.assertTrue(out.endswith("…"))
+        self.assertEqual(len(warns), 1)
+
+    def test_adapt_title_short_title_untouched(self):
+        out, warns = meta.adapt_title("短标题", platforms.BY_KEY["douyin"])
+        self.assertEqual(out, "短标题")
+        self.assertEqual(warns, [])
+
+    def test_adapt_title_pads_hupu_minimum(self):
+        plat = platforms.BY_KEY["hupu"]            # 4~40
+        out, warns = meta.adapt_title("好", plat)
+        self.assertGreaterEqual(len(out), 4)
+        self.assertEqual(len(warns), 1)
+
+    def test_adapt_tags_cap(self):
+        plat = platforms.Platform(key="x", label="X", tags_max=2)
+        self.assertEqual(meta.adapt_tags(["a", "b", "c"], plat), ["a", "b"])
+
+
+# ── argv 组装（最要紧的一组）────────────────────────────────────
+class TestBuildArgv(unittest.TestCase):
+    def setUp(self):
+        self.cfg = Config(sau=SauConfig())
+        self.sau = Path("/fake/sau")
+        self.video = Path("/tmp/v.mp4")
+        self.m = meta.Meta(title="标题", desc="简介", tags=["AI", "科技"], tid=171)
+
+    def argv(self, key, covers=None, m=None):
+        return sau.build_upload_argv(
+            self.sau, platforms.BY_KEY[key], "acct", self.video,
+            m or self.m, covers or {}, self.cfg)
+
+    def test_common_flags(self):
+        a = self.argv("douyin")
+        # 用 str(Path) 比较，否则 Windows 上 '/fake/sau' 会变成 '\fake\sau'
+        self.assertEqual(a[0], str(self.sau))
+        self.assertEqual(a[1:3], ["douyin", "upload-video"])
+        self.assertIn("--account", a)
+        self.assertIn("--file", a)
+        self.assertIn("--title", a)
+        self.assertIn("--tags", a)
+        self.assertIn("--headless", a)
+        self.assertIn("AI,科技", a)
+
+    def test_bilibili_gets_tid(self):
+        self.assertIn("--tid", self.argv("bilibili"))
+        self.assertIn("171", self.argv("bilibili"))
+
+    def test_tid_override_from_meta(self):
+        m = meta.Meta(title="t", desc="d", tid=249)
+        a = self.argv("bilibili", m=m)
+        self.assertEqual(a[a.index("--tid") + 1], "249")
+
+    def test_non_bilibili_never_gets_tid(self):
+        for key in ("douyin", "weibo", "youtube", "hupu"):
+            with self.subTest(key=key):
+                self.assertNotIn("--tid", self.argv(key))
+
+    def test_dual_cover_only_for_douyin_tencent(self):
+        covers = {"thumbnail_landscape": Path("/c/43.png"),
+                  "thumbnail_portrait": Path("/c/34.png")}
+        for key in ("douyin", "tencent"):
+            with self.subTest(key=key):
+                a = self.argv(key, covers)
+                self.assertIn("--thumbnail-landscape", a)
+                self.assertIn("--thumbnail-portrait", a)
+        # 小红书只支持单张
+        a = self.argv("xiaohongshu", covers)
+        self.assertNotIn("--thumbnail-landscape", a)
+
+    def test_single_cover_uses_thumbnail(self):
+        a = self.argv("xiaohongshu", {"thumbnail": Path("/c/34.png")})
+        self.assertIn("--thumbnail", a)
+        self.assertNotIn("--thumbnail-portrait", a)
+
+    def test_cover_not_passed_when_platform_lacks_capability(self):
+        # hupu 支持封面；构造一个没有 COVER 能力的平台来验证「不乱传」
+        plat = platforms.Platform(key="x", label="X")
+        a = sau.build_upload_argv(self.sau, plat, "acct", self.video,
+                                  self.m, {"thumbnail": Path("/c/x.png")}, self.cfg)
+        self.assertNotIn("--thumbnail", a)
+
+    def test_schedule_only_where_supported(self):
+        m = meta.Meta(title="t", desc="d", schedule="2026-03-24 21:30")
+        for key in ("douyin", "kuaishou", "xiaohongshu", "bilibili", "tencent"):
+            with self.subTest(key=key):
+                self.assertIn("--schedule", self.argv(key, m=m))
+        # 虎扑/微博/YouTube/百家号/支付宝都不支持定时
+        for key in ("hupu", "weibo", "youtube", "baijiahao", "alipay"):
+            with self.subTest(key=key):
+                self.assertNotIn("--schedule", self.argv(key, m=m))
+
+    def test_youtube_visibility_and_playlist(self):
+        m = meta.Meta(title="t", desc="d", playlist="我的系列", visibility="unlisted")
+        a = self.argv("youtube", m=m)
+        self.assertIn("--visibility", a)
+        self.assertEqual(a[a.index("--visibility") + 1], "unlisted")
+        self.assertIn("--playlist", a)
+
+    def test_collection_only_where_supported(self):
+        m = meta.Meta(title="t", desc="d", collection="我的合集")
+        self.assertIn("--collection", self.argv("tencent", m=m))
+        self.assertNotIn("--collection", self.argv("hupu", m=m))
+
+    def test_bilibili_desc_never_empty(self):
+        # sau 里 bilibili 的 --desc 是 required=True，空字符串也会被 argparse 收下，
+        # 但为空时传的是标题兜底 —— 验证这个兜底逻辑
+        m = meta.Meta(title="只有标题", desc="")
+        a = self.argv("bilibili", m=m)
+        self.assertEqual(a[a.index("--desc") + 1], "只有标题")
+
+    def test_no_shell_string_joining(self):
+        # 标题里带引号和 $ 不能出问题（因为传的是 argv 数组，不拼 shell）
+        m = meta.Meta(title='a"b$c`d', desc="d")
+        a = self.argv("douyin", m=m)
+        self.assertIn('a"b$c`d', a)
+
+    def test_headed_flag(self):
+        a = sau.build_upload_argv(self.sau, platforms.BY_KEY["douyin"], "acct",
+                                  self.video, self.m, {}, self.cfg, headless=False)
+        self.assertIn("--headed", a)
+        self.assertNotIn("--headless", a)
+
+
+# ── 账号发现 ────────────────────────────────────────────────────
+class TestAccounts(unittest.TestCase):
+    def test_discover_and_pick(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cookies = root / "cookies"
+            cookies.mkdir()
+            (cookies / "douyin_我的抖音.json").write_text("{}", encoding="utf-8")
+            (cookies / "douyin_备用_账号.json").write_text("{}", encoding="utf-8")
+            (cookies / "bilibili_我的B站.json").write_text("{}", encoding="utf-8")
+            (cookies / "乱七八糟.json").write_text("{}", encoding="utf-8")
+
+            cfg = Config(sau=SauConfig(root=root))
+            found = sau.discover_accounts(cfg)
+            self.assertEqual(sorted(found["douyin"]), sorted(["我的抖音", "备用_账号"]))
+            self.assertEqual(found["bilibili"], ["我的B站"])
+            # 认不出平台的应被忽略
+            self.assertNotIn("乱七八糟", found)
+
+            # 多个账号且没配 → 取名字最短的（可预测，不随机）
+            # 「我的抖音」和「备用_账号」都是 4 个字，按 (长度, 码点) 排序取第一个
+            self.assertEqual(
+                sau.pick_account(cfg, "douyin", found),
+                sorted(["我的抖音", "备用_账号"], key=lambda s: (len(s), s))[0])
+            # 配了就用配的
+            cfg.sau.accounts["douyin"] = "备用_账号"
+            self.assertEqual(sau.pick_account(cfg, "douyin", found), "备用_账号")
+
+    def test_account_file_naming(self):
+        cfg = Config(sau=SauConfig(root=Path("/root")))
+        self.assertEqual(sau.account_file(cfg, "douyin", "我的抖音").name,
+                         "douyin_我的抖音.json")
+
+    def test_no_cookies_dir(self):
+        cfg = Config(sau=SauConfig(root=Path("/definitely/not/here")))
+        self.assertEqual(sau.discover_accounts(cfg), {})
+
+
+# ── 封面 ────────────────────────────────────────────────────────
+class TestCover(unittest.TestCase):
+    def test_crop_wider_source(self):
+        # 1920x1080 裁成 3:4 → 宽度收到 810（1080*3/4），高度不动
+        self.assertEqual(cover._crop_for(1920, 1080, "3:4"), "crop=810:1080:555:0")
+
+    def test_crop_taller_source(self):
+        # 1080x1920 裁成 16:9 → 高度收到 608（1080/1.777）
+        out = cover._crop_for(1080, 1920, "16:9")
+        self.assertTrue(out.startswith("crop=1080:608:0:"), out)
+
+    def test_crop_same_ratio(self):
+        self.assertEqual(cover._crop_for(1920, 1080, "16:9"), "crop=1920:1080:0:0")
+
+    def test_ratios_for(self):
+        dual = cover.ratios_for("douyin", platforms.BY_KEY["douyin"].caps)
+        self.assertEqual(dual, {"thumbnail_landscape": "4:3",
+                                "thumbnail_portrait": "3:4"})
+        self.assertEqual(cover.ratios_for("bilibili", platforms.BY_KEY["bilibili"].caps),
+                         {"thumbnail": "16:9"})
+        self.assertEqual(cover.ratios_for("weibo", platforms.BY_KEY["weibo"].caps),
+                         {"thumbnail": "3:4"})
+
+    def test_same_ratio_shared_across_platforms(self):
+        # 抖音竖版和微博都是 3:4 → 应该指向同一个比例，调用方才能按比例去重
+        a = cover.ratios_for("douyin", platforms.BY_KEY["douyin"].caps)
+        b = cover.ratios_for("weibo", platforms.BY_KEY["weibo"].caps)
+        self.assertEqual(a["thumbnail_portrait"], b["thumbnail"])
+
+
+# ── 报表（中文对齐）─────────────────────────────────────────────
+class TestReport(unittest.TestCase):
+    def test_width_counts_cjk_as_two(self):
+        self.assertEqual(report.width("abc"), 3)
+        self.assertEqual(report.width("抖音"), 4)
+        self.assertEqual(report.width("抖音ab"), 6)
+
+    def test_table_columns_line_up(self):
+        rows = [
+            {"p": "抖音", "r": "✓ 已发布"},
+            {"p": "YouTube", "r": "✗ 失败"},
+        ]
+        text = report.table(rows, [("p", "平台", "left"), ("r", "结果", "left")])
+        lines = text.splitlines()
+        # 表头、分隔线、两行数据 —— 每行的显示宽度必须一致
+        widths = {report.width(ln) for ln in lines}
+        self.assertEqual(len(widths), 1, f"表格没对齐：{widths}\n{text}")
+
+    def test_truncate_respects_width(self):
+        self.assertEqual(report.truncate("抖音抖音抖音", 4), "抖…")
+
+    def test_summarize(self):
+        got = report.summarize([{"status": "ok"}, {"status": "ok"},
+                                {"status": "fail"}, {"status": "skip"}])
+        self.assertEqual((got["ok"], got["fail"], got["skip"], got["total"]),
+                         (2, 1, 1, 4))
+
+    def test_human_duration(self):
+        self.assertEqual(report.human_duration(45), "45.0 秒")
+        self.assertEqual(report.human_duration(125), "2 分 5 秒")
+
+
+# ── 状态 ────────────────────────────────────────────────────────
+class TestState(unittest.TestCase):
+    def test_roundtrip_and_idempotency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "v.mp4"
+            video.write_bytes(b"hello")
+            store = state.Store(Path(tmp) / "rec.json")
+            rec = store.get(video)
+            self.assertFalse(rec.is_ok("douyin"))
+            rec.mark("douyin", state.OK)
+            store.put(video, rec)
+            store.save()
+
+            again = state.Store(Path(tmp) / "rec.json")
+            self.assertTrue(again.get(video).is_ok("douyin"))
+            self.assertFalse(again.get(video).is_ok("bilibili"))
+
+    def test_key_changes_when_file_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "v.mp4"
+            video.write_bytes(b"a")
+            k1 = state.video_key(video)
+            time.sleep(0.01)
+            video.write_bytes(b"bb")            # 大小变了
+            os.utime(video, (time.time() + 5, time.time() + 5))
+            self.assertNotEqual(k1, state.video_key(video))
+
+    def test_forget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "v.mp4"
+            video.write_bytes(b"x")
+            store = state.Store(Path(tmp) / "rec.json")
+            rec = store.get(video)
+            rec.mark("douyin", state.OK)
+            store.put(video, rec)
+            self.assertTrue(store.forget(video))
+            self.assertFalse(store.get(video).is_ok("douyin"))
+
+
+# ── cookie 过期估算 ─────────────────────────────────────────────
+class TestCookieExpiry(unittest.TestCase):
+    def _write(self, tmp, cookies):
+        p = Path(tmp) / "c.json"
+        p.write_text(json.dumps({"cookies": cookies, "origins": []}), encoding="utf-8")
+        return p
+
+    def test_prefers_session_cookie(self):
+        from vp_publish import doctor
+        with tempfile.TemporaryDirectory() as tmp:
+            now = time.time()
+            p = self._write(tmp, [
+                {"name": "some_tracking", "expires": now + 365 * 86400},
+                {"name": "sessionid", "expires": now + 7 * 86400},
+            ])
+            exp, why = doctor.read_cookie_expiry(p)
+            self.assertIsNotNone(exp)
+            self.assertIn("sessionid", why)
+            self.assertAlmostEqual((exp - now) / 86400, 7, delta=0.1)
+
+    def test_ignores_expired_and_session_cookies(self):
+        from vp_publish import doctor
+        with tempfile.TemporaryDirectory() as tmp:
+            now = time.time()
+            p = self._write(tmp, [
+                {"name": "dead", "expires": now - 86400},
+                {"name": "session_only", "expires": -1},
+            ])
+            exp, why = doctor.read_cookie_expiry(p)
+            self.assertIsNone(exp)
+
+    def test_bad_file_does_not_raise(self):
+        from vp_publish import doctor
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "c.json"
+            p.write_text("not json", encoding="utf-8")
+            exp, why = doctor.read_cookie_expiry(p)
+            self.assertIsNone(exp)
+
+
+# ── 配置 ────────────────────────────────────────────────────────
+class TestConfig(unittest.TestCase):
+    def test_missing_file_uses_defaults(self):
+        from vp_publish import config as config_mod
+        cfg = config_mod.load(Path("/definitely/not/here.json"))
+        self.assertEqual(cfg.tid, 171)
+        self.assertTrue(cfg.cover)
+
+    def test_partial_override(self):
+        from vp_publish import config as config_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "c.json"
+            p.write_text(json.dumps({"tid": 249, "default_tags": ["AI"],
+                                     "sau": {"root": "/opt/sau"}}), encoding="utf-8")
+            cfg = config_mod.load(p)
+            self.assertEqual(cfg.tid, 249)
+            self.assertEqual(cfg.default_tags, ["AI"])
+            self.assertEqual(cfg.sau.root, Path("/opt/sau"))
+            # bin 应跟着 root 推导
+            self.assertEqual(cfg.sau.bin, Path("/opt/sau/.venv/bin/sau"))
+
+    def test_broken_json_falls_back(self):
+        from vp_publish import config as config_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "c.json"
+            p.write_text("{ broken", encoding="utf-8")
+            cfg = config_mod.load(p)
+            self.assertEqual(cfg.tid, 171)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# 虚拟环境（sau 装在 ~/sau，不在仓库里；但本仓库也可能被建 venv）
+.venv/
+venv/
+
+# 凭据 —— 绝对不要提交
+cookies/
+*.cookie
+cookies.json
+conf.py
+config.local.json
+
+# 运行时产物
+*.log
+records.json
+covers/
+videos/
+*.mp4
+*.mov
+*.mkv
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""vp-publish 入口（免安装版）。
+
+这个文件让「克隆下来就能用」成立——不需要 pip install、不需要装到系统里。
+它把仓库根目录塞进 sys.path，然后调 vp_publish.cli.main。
+
+用 `python3 -m vp_publish` 效果一样；这个脚本只是省几个字符，
+顺便让 `ln -s .../vp-publish ~/bin/vp-publish` 这种用法成立。
+"""
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from vp_publish.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

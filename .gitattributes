@@ -1,0 +1,32 @@
+# 全部按 LF 存进仓库。
+#
+# 为什么必须显式写：本仓库在 Windows 上开发、在 Linux 板子上运行。
+# 默认的 core.autocrlf=true 会把 shell 脚本和 Python 入口文件写成 CRLF，
+# 到 Linux 上 shebang 就变成 `#!/usr/bin/env bash\r` → 报
+# `bad interpreter: No such file or directory`，而且**看不出是行尾问题**。
+* text=auto eol=lf
+
+# 二进制文件不要动
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mp4 binary
+*.mov binary
+*.zip binary
+*.tar.xz binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
+
+# 明确一下：这些必须是 LF，出问题会很难查
+*.sh    text eol=lf
+*.py    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+vp-publish  text eol=lf
+publish-all text eol=lf

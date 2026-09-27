@@ -1,0 +1,449 @@
+# vp-publish —— 一键上传视频到各个平台
+
+一条命令，把同一个视频发到**抖音 / 小红书 / 快手 / B站 / 视频号 / 微博 / 虎扑 / 百家号 / 支付宝生活号 / YouTube**。
+
+```bash
+./vp-publish 我的视频.mp4
+```
+
+就这样。不用写配置文件，不用开开关，不用记住每个平台参数有什么不一样。
+
+---
+
+## 为什么需要这个东西
+
+上游已经有两个成熟项目把「最难的部分」解决了：
+
+| 项目 | 干什么 | 为什么不能直接用 |
+|---|---|---|
+| [social-auto-upload](https://github.com/dreammis/social-auto-upload)（15k★, MIT） | 浏览器自动化：扫码登录、创作者后台上传、过风控 | 一次只能发一个平台，且每个平台参数不同 |
+| [biliup](https://github.com/biliup/biliup)（B站原生二进制） | B站投稿 | 只管 B站 |
+
+它们都是**单平台**工具。真正的痛点在中间那层——**编排**：
+
+- 我到底登录了哪些平台？（sau 要你手工改 `enabled: true`）
+- 每个平台标题能写多长？（微博 30 字，虎扑 4~40 字，YouTube 100 字，其余各不同）
+- 每个平台封面要什么比例？（抖音 3:4 竖 + 4:3 横，B站 16:9）
+- B站必须传分区 id，虎扑**没有**定时发布参数——忘了就被 argparse 打回
+- 第 7 个平台失败时，前 6 个已经发出去了，怎么不重发？
+
+vp-publish 就是这一层。**它不碰浏览器、不碰上传协议**——那些是 sau 的活，
+而且它比我写得好。它只做编排。
+
+---
+
+## 安装
+
+### 方式一：一键脚本（推荐，在板子上跑）
+
+```bash
+git clone <本仓库> ~/vp-publish
+cd ~/vp-publish
+bash bootstrap.sh
+```
+
+`bootstrap.sh` 会把 sau、两套 chromium、ffmpeg、系统库全部装好。
+它里面每一步都对应一个**真机上踩过的坑**，见文件头部注释。
+
+只体检不安装：
+
+```bash
+bash bootstrap.sh --check
+```
+
+### 方式二：手动
+
+```bash
+# 1. 系统依赖
+sudo apt-get update && sudo apt-get install -y git python3-venv ffmpeg \
+  libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 \
+  libdrm2 libgbm1 libasound2t64 libxkbcommon0 libxcomposite1 \
+  libxdamage1 libxfixes3 libxrandr2 libpango-1.0-0 libcairo2
+
+# 2. sau（注意 --ignore-requires-python，见下面「踩过的坑」）
+git clone --depth 1 https://github.com/dreammis/social-auto-upload.git ~/sau
+cd ~/sau && python3 -m venv .venv
+.venv/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    --ignore-requires-python -e .
+.venv/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple playwright
+cp conf.example.py conf.py
+
+# 3. 浏览器（两套，patchright 和 playwright 各要一份）
+.venv/bin/patchright install chromium
+.venv/bin/playwright install chromium
+```
+
+vp-publish 本体**不需要安装**——`./vp-publish` 直接就能跑，
+因为它零运行时依赖（只用 Python 标准库）。
+
+想装到 PATH 里也行：
+
+```bash
+pip install -e .          # 之后可以用 vp-publish / publish-all
+# 或者
+ln -s "$PWD/vp-publish" ~/bin/vp-publish
+```
+
+---
+
+## 用法
+
+### 发一个视频
+
+```bash
+./vp-publish 我的视频.mp4
+```
+
+自动做这些事：
+
+1. 扫 `~/sau/cookies/` 看你登录了哪些平台
+2. 从视频旁边找元数据（`我的视频.json` / `meta.json` / `我的视频.txt`），没有就用文件名当标题
+3. 按每个平台的规矩裁标题、选封面比例、补必填参数
+4. 逐个平台上传，一个失败不影响其他
+5. 记下结果，**下次重跑会跳过已成功的**
+
+### 常用参数
+
+```bash
+# 只发指定平台（认中文名、英文名、常用缩写）
+./vp-publish v.mp4 --only 抖音,B站,xhs
+
+# 跳过某个平台
+./vp-publish v.mp4 --skip youtube
+
+# 指定标题/简介/标签/封面
+./vp-publish v.mp4 -t "标题" -d "简介" -T "AI,科技" -c cover.png
+
+# 定时发布（只有抖音/快手/小红书/B站/视频号支持）
+./vp-publish v.mp4 --schedule "2026-03-24 21:30"
+
+# 先看看会执行什么，不真发
+./vp-publish v.mp4 --dry-run
+
+# 重发（忽略「已发过」记录）
+./vp-publish v.mp4 --force
+
+# 批量：整个目录的视频
+./vp-publish ~/vp/videos/
+
+# 给脚本/agent 用的 JSON 输出
+./vp-publish v.mp4 --json
+```
+
+### 体检
+
+```bash
+./vp-publish doctor              # 秒级，只看本地
+./vp-publish doctor --live       # 实连每个平台验活（慢但准）
+```
+
+输出长这样：
+
+```
+环境
+────────────────────────────────────────────────────────────
+  ✓ sau            /home/radxa/sau/.venv/bin/sau
+  ✓ ffmpeg          可用（自动生成封面）
+  ✓ 浏览器          chromium-1208, chromium_headless_shell-1208
+  ✓ 代理            http://127.0.0.1:7890 可达
+
+平台（离线判断，加 --live 可实连验活）
+────────────────────────────────────────────────────────────
+平台          账号         状态      说明
+────────────────────────────────────────────────────
+抖音          我的抖音     ✓ 就绪    约 60 天后过期
+小红书        我的小红书   ✓ 就绪    ⚠ 只剩 2.0 天
+快手          —            · 未登录  还没登录
+B站           我的B站      ✓ 就绪    约 120 天后过期
+...
+YouTube       我的YouTube  ✓ 就绪    约 30 天后过期
+
+可以直接发：5/10 个平台 —— 抖音, 小红书, B站, 微博, YouTube
+```
+
+**「只剩 2.0 天」这行是重点。** 多平台发布的失败，大多数不是上传那一刻才发生的，
+而是那个平台的 cookie 三天前就过期了。体检把这 10 分钟的排查提前到 3 秒。
+
+### 登录
+
+每个平台登录一次（**要人操作**，扫码或输账号）：
+
+```bash
+./vp-publish login douyin --headed
+./vp-publish login xiaohongshu --headed
+./vp-publish login bilibili --headed
+./vp-publish login youtube --headed     # Google 账号，不是扫码
+```
+
+`--headed` 会显示浏览器窗口，**推荐加上**——出问题时你能直接看到卡在哪一步。
+登录过程中生成的二维码图片路径会打印出来。
+
+看已登录的账号：
+
+```bash
+./vp-publish accounts
+```
+
+### 其他
+
+```bash
+./vp-publish platforms          # 列出所有平台及其能力（标题长度/封面/定时/合集）
+./vp-publish init               # 生成配置文件模板
+./vp-publish forget v.mp4       # 清掉某个视频的发布记录
+```
+
+---
+
+## 平台能力对照表
+
+`./vp-publish platforms` 的实时输出，这里放一份便于查阅：
+
+| key | 平台 | 登录 | 标题长度 | 封面 | 定时 | 合集 | 备注 |
+|---|---|---|---|---|---|---|---|
+| `douyin` | 抖音 | 扫码 | — | 横 4:3 + 竖 3:4 | ✓ | ✓ | |
+| `xiaohongshu` | 小红书 | 扫码 | — | 3:4 | ✓ | | |
+| `kuaishou` | 快手 | 扫码 | — | 3:4 | ✓ | ✓ | |
+| `bilibili` | B站 | 扫码 | — | 16:9 | ✓ | | **必须传 `--tid`**，默认 171 |
+| `tencent` | 视频号 | 扫码 | — | 横 4:3 + 竖 3:4 | ✓ | ✓ | |
+| `weibo` | 微博 | 扫码 | ≤30 | 3:4 | | ✓ | 封面建议 <5MB |
+| `hupu` | 虎扑 | 浏览器 | 4~40 | 3:4 | | | 登录要输 QQ/手机号 |
+| `baijiahao` | 百家号 | 扫码 | — | 3:4 | | ✓ | |
+| `alipay` | 支付宝生活号 | 扫码 | — | 3:4 | | ✓ | 需先开通生活号权限 |
+| `youtube` | YouTube | 浏览器 | ≤100 | 16:9 | | | **必须挂代理**；支持播放列表/可见性 |
+
+「—」表示 sau 文档没写、我们也不猜——不裁剪，交给平台自己处理。
+真踩到坑了，在配置里覆盖：
+
+```json
+{ "title_max": { "douyin": 55 } }
+```
+
+---
+
+## 配置
+
+`~/.config/vp-publish/config.json`（可选，**所有字段都有能用的默认值**）：
+
+```bash
+./vp-publish init      # 生成模板
+```
+
+```json
+{
+  "sau": {
+    "root": "~/sau",
+    "bin": "~/sau/.venv/bin/sau",
+    "headless": true,
+    "accounts": { "douyin": "我的抖音" }
+  },
+  "default_tags": ["AI", "科技"],
+  "tid": 171,
+  "visibility": "public",
+  "proxy": "http://127.0.0.1:7890",
+  "cover": true,
+  "cover_at": 1.0,
+  "timeout": 900,
+  "retries": 0,
+  "title_max": {}
+}
+```
+
+用 JSON 而不是 YAML，是因为 sau 的 venv 里没有 PyYAML——
+而本工具刻意设计成「用系统 python3 就能跑」，这样它坏了不连累 sau，
+sau 升级了也不连累它。
+
+---
+
+## 设计取舍
+
+### 封面自动生成，按**比例**缓存
+
+没给封面时，用 ffmpeg 从视频第 1 秒抽一帧，裁成平台要的比例。
+
+为什么是第 1 秒不是第 0 帧：很多视频开头是纯黑或淡入，第 0 帧基本是黑的。
+
+关键细节：比例是**平台无关**的——抖音的竖版 3:4 和微博的 3:4 是同一张图。
+所以按比例缓存，不按平台。实测 5 个平台从生成 6 个文件降到 3 个：
+
+```
+之前：3x4-douyin.png  3x4-weibo.png  3x4-xiaohongshu.png  ← 三个一模一样的文件
+现在：3x4.png                                              ← 一个，三个平台共用
+```
+
+生成出来的尺寸实测：`1920x1080` / `1080x1440` / `1440x1080`。
+
+### 标题裁剪会说清楚
+
+按平台长度裁剪时**一定打印警告**，告诉你原标题和裁后结果。
+悄悄改用户标题比报错更糟。不想被裁就自己改短，或者在配置里调大上限。
+
+### 参数值走 argv 数组，绝不拼 shell 字符串
+
+标题里有 `$`、引号、反引号、emoji 都不会出问题。
+（这是最容易埋的坑：`f"{cmd} --title {title}"` 一遇到引号就炸。）
+
+### 幂等：重跑不重发
+
+发布记录存 `~/.local/state/vp-publish/records.json`，**不写进视频目录**。
+理由：视频目录可能是只读挂载、可能被 rsync 同步、可能被清理脚本扫到。
+状态文件不该混在内容里。
+
+指纹用「路径 + 大小 + mtime」，**不做内容哈希**——10GB 的视频读一遍要几分钟，
+而这三个值已经足够回答「这是不是刚才那个文件」。
+
+### 失败隔离
+
+单个平台失败不影响其他平台，最后给一张汇总表。
+退出码：全成功 0，有失败 1。可以直接接在流水线里。
+
+---
+
+## 实测数据
+
+板子：Radxa Cubie A7A（全志 A733，8 核，3.8GB RAM），Debian 13 trixie，Python 3.13.5。
+
+**各平台创作者后台可达性**（patchright chromium 145 headless，从板子实测）：
+
+| 平台 | 结果 |
+|---|---|
+| 抖音创作者中心 | HTTP 200 / 2.0s |
+| B站创作中心 | HTTP 200 / 1.4s |
+| 小红书创作服务平台 | HTTP 200 / 1.8s |
+| 视频号助手 | HTTP 200 / 2.5s |
+| YouTube Studio | 直连超时 45s → **走 `http://127.0.0.1:7890` 代理 HTTP 200 / 1.5s** |
+
+**浏览器启动**：patchright 和 playwright 都能拉起 `chromium 145.0.7632.0`。
+
+**端到端编排**（`--dry-run`，5 个平台）：2.1 秒，各平台 argv 逐个核对无误。
+
+> ⚠️ **未验证的一环**：真实登录后的实际上传。这需要人扫码，无法自动化。
+> 编排层、参数组装、封面生成、浏览器栈都已实测通过；
+> 上传动作本身由 sau 完成，它是 15k★ 的成熟项目。
+
+---
+
+## 踩过的坑（改代码前先看）
+
+这一节是给未来的自己看的。每条都在真机上复现过。
+
+### sau 相关
+
+1. **sau 的 `pyproject.toml` 声明 `requires-python = ">=3.10,<3.13"`，但板子是 3.13.5**
+   → pip 直接拒绝安装。依赖（loguru / opencv-python / patchright / requests /
+   qrcode / segno）在 3.13 上其实都正常，只是上游没测过。
+   必须 `--ignore-requires-python`。
+
+2. **sau 的 `pyproject.toml` 只列了 `patchright`，但 9 个文件 `import playwright`**
+   （weibo / hupu / tiktok / xhs / alipay / baijiahao 的 uploader，加 `myUtils/login.py`、
+   `myUtils/auth.py`）。而 `sau_cli.py` 在**导入阶段**就 import `baijiahao_uploader`，
+   所以缺 playwright 时**整个 CLI 起不来**，报的错还指向百家号，容易误判。
+   必须手动补装 `playwright`。
+
+3. **patchright 和 playwright 的版本号不同步**：patchright 1.58.2 ≈ playwright 1.58.0。
+   不能拿 patchright 的版本号去 `pip install playwright==1.58.2`（那个版本不存在）。
+
+4. **sau 的 CLI 需要 `conf.py`**，仓库里只有 `conf.example.py`，要手动复制。
+
+5. **`sau bilibili` 的 `--desc` 和 `--tid` 都是 `required=True`**（不是可选！）。
+
+6. **虎扑既没有 `--schedule` 也没有 `--collection`**；微博/支付宝有 `--collection` 但没有 `--schedule`。
+   给不支持的平台传这些参数 → argparse 直接报错。
+
+7. **`PUT /configs` 类接口要注意 `?force=true`**（这是 mihomo 的坑，但同理：
+   上游 API 经常有「不加参数就静默忽略」的行为，改完必须验回来）。
+
+### 环境相关
+
+8. **板子的 `/var/lib/apt/lists/` 可能是空的**（0 个 Packages 文件）。
+   症状很迷惑：`apt-cache policy` 里连**已安装**的包都没有候选版本，
+   `apt-get install` 什么都装不上。**先 `apt-get update`**，别假设它跑过。
+
+9. **板子没有 `git`**（radxa 的 Debian 镜像默认不带）。
+
+10. **`python3 -m venv` 报 `ensurepip is not available`** → 缺 `python3-venv` 包。
+    注意：`python3 -c "import venv"` 是能成功的，这个检查**测不出问题**。
+
+11. **PyPI 直连在板子上不通**（`https://pypi.org/simple/` 超时无响应），
+    但清华/阿里镜像通（200/4.2s），`files.pythonhosted.org` 也通。pip 必须走镜像。
+
+12. **npmmirror 的 playwright 镜像路径已失效**：
+    `https://npmmirror.com/mirrors/playwright/builds/chromium/1208/...` 返回阿里云错误 XML。
+    **官方 CDN 反而更快**：`cdn.playwright.dev` 实测 2MB/s，
+    最终 302 到 `playwright.download.prss.microsoft.com`。
+    所以 `PLAYWRIGHT_DOWNLOAD_HOST` 应该**留空**，不要设 npmmirror。
+
+13. **板子自带的 `chromium-browser` 可能是坏的**：
+    `chromium-browser --version` 报 `libnss3.so: cannot open shared object file`。
+    装了 `libnss3 libnspr4` 等运行库后才能用（版本 120，偏老）。
+    但 sau 用的是自己的 chromium 145，所以这个只影响「用系统 chromium 兜底」的路径。
+
+### 本工具相关
+
+14. **argparse 里 `nargs="*"` 的位置参数和子命令不能共存**。
+    第一个位置参数会被拿去匹配子命令名，于是 `vp-publish final.mp4` 报
+    `invalid choice: 'final.mp4'`。解决：手动分派——先看 `argv[0]` 是不是已知子命令。
+
+15. **中文表格对齐要自己算显示宽度**。`len("抖音")` 是 2，但它占 4 列。
+    不处理的话表格全歪。见 `report.width()`。
+
+16. **SSH heredoc 里写含嵌套引号的 Python 会炸**（转义层数太多）。
+    改成「本地写文件 → scp 过去」两步法，可靠得多。
+
+---
+
+## 目录结构
+
+```
+vp-publish/
+├── vp-publish                 # 入口（免安装，直接跑）
+├── publish-all                # 同一个东西的别名
+├── bootstrap.sh               # 一键装环境
+├── vp_publish/
+│   ├── cli.py                 # 命令行、发布主流程
+│   ├── platforms.py           # 平台能力矩阵（照着 argparse 核出来的）
+│   ├── meta.py                # 元数据推导 + 按平台适配
+│   ├── sau.py                 # sau 后端封装（唯一知道 sau 长什么样的地方）
+│   ├── cover.py               # ffmpeg 抽帧 + 按比例裁剪
+│   ├── doctor.py              # 体检
+│   ├── state.py               # 幂等记录
+│   ├── config.py              # 配置（零依赖 JSON）
+│   └── report.py              # 表格渲染（含中文宽度）
+└── tests/
+    ├── test_vp_publish.py     # 53 项单元测试
+    ├── reach_probe.py         # 实测各平台可达性
+    └── reach_proxy.py         # 实测 YouTube 走代理
+```
+
+---
+
+## 测试
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+53 项，覆盖平台别名解析、argv 组装、元数据推导、标题裁剪、
+封面比例计算、账号发现、cookie 过期估算、中文表格对齐、状态幂等。
+
+不覆盖「真实上传」——那个需要人扫码，见「实测数据」一节。
+
+---
+
+## 与 vp-pipeline 的关系
+
+[vp-pipeline](../vp-pipeline) 是「话题 → 文案 → 配音 → 画面 → 成片」的生产线。
+它的最后一步（发布）原本是内嵌的 `publish.py`，只支持 biliup + sau 的简单封装。
+
+vp-publish 把这一层独立出来了，vp-pipeline 的发布步骤可以直接换成：
+
+```bash
+./vp-publish "$VIDEO" --json
+```
+
+好处：发布逻辑可以单独升级、单独测试，不用碰整条流水线。
+
+---
+
+## 许可
+
+MIT
