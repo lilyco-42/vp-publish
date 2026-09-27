@@ -830,16 +830,40 @@ class TestWatchNoPlatform(unittest.TestCase):
 
 # ── 网页扫码登录 ─────────────────────────────────────────────────
 class TestLoginWeb(unittest.TestCase):
-    """login-web 里最容易写错的两件事：日志清理、以及「认哪张二维码」。"""
+    """login-web 里最容易写错的三件事：日志清理、「认哪张二维码」、
+    以及换码/换平台时那张旧码该不该留。"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         (self.root / "cookies").mkdir()
         self.cfg = Config(sau=SauConfig(root=self.root))
+        # 别往用户家里写日志
+        self._cache = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = str(self.root / "cache")
 
     def tearDown(self):
+        if self._cache is None:
+            os.environ.pop("XDG_CACHE_HOME", None)
+        else:
+            os.environ["XDG_CACHE_HOME"] = self._cache
         self.tmp.cleanup()
+
+    def _hub(self):
+        """造一个**能真的 spawn 起来**的假 sau（直接用当前解释器）。
+
+        不然 Hub 会在「没找到 sau」那一步就返回，后面的逻辑一行都走不到 ——
+        这正是 test_start_rejects_unknown_platform 最初失败的原因。
+        用 sys.executable 是为了跨平台：Windows 上没法执行 `#!/bin/sh` 脚本。
+        """
+        from vp_publish import loginweb
+        cfg = Config(sau=SauConfig(root=self.root, bin=Path(sys.executable)))
+        return loginweb.Hub(cfg)
+
+    def _qr(self, plat, acct, stamp="20260101_000001", body=b"x"):
+        p = self.root / "cookies" / f"{plat}_{acct}_login_qrcode_{stamp}.png"
+        p.write_bytes(body)
+        return p
 
     def test_strip_noise_drops_qr_blocks_keeps_real_lines(self):
         """日志区不能被终端二维码刷满 —— 否则真错误反而看不见。"""
@@ -912,6 +936,81 @@ class TestLoginWeb(unittest.TestCase):
         out = hub.start("不存在的平台")
         self.assertFalse(out["ok"])
         self.assertIn("认不出", out["error"])
+
+    def test_start_rejects_unknown_platform_even_without_sau(self):
+        """平台名是**调用方的入参错误**，不该被「本机没装 sau」盖住。
+
+        顺序反过来的话，在一台没装 sau 的机器上传个错平台名，
+        得到的是「没找到 sau」——驴唇不对马嘴，排查时会被带偏。
+
+        注意**不要**靠「这台机器上有没有 sau」来构造前提：第一版这么写，
+        本机（没装 sau）绿、板子（venv 在 PATH 里）红。直接改属性，
+        跟环境无关。
+        """
+        from vp_publish import loginweb
+        hub = loginweb.Hub(self.cfg)
+        hub.sau_path = None                       # 装成「这台机器上没 sau」
+        hub.problem = "没找到 sau（social-auto-upload）。"
+        out = hub.start("不存在的平台")
+        self.assertFalse(out["ok"])
+        self.assertIn("认不出", out["error"])
+        self.assertNotIn("sau", out["error"])
+
+    def test_same_platform_keeps_old_qr_while_swapping(self):
+        """同一个平台换码时，旧码要留着。
+
+        chromium 起来要十几秒，这段时间页面如果没码，用户会以为坏了。
+        """
+        from vp_publish import loginweb
+        hub = self._hub()
+        qr = self._qr("douyin", "我的抖音")
+        hub.session.platform = "douyin"
+        hub.session.account = "我的抖音"
+        hub.session.qr_path = qr
+        hub.session.qr_mtime = 123.0
+        try:
+            out = hub.start("douyin")
+            self.assertTrue(out["ok"])
+            self.assertTrue(out["reused"], "同一个平台应该算「换一张码」")
+            self.assertEqual(hub.session.qr_path, qr, "换码期间旧码被清掉了")
+            self.assertEqual(hub.session.qr_mtime, 123.0)
+        finally:
+            hub.shutdown()
+
+    def test_switching_platform_clears_old_qr(self):
+        """换平台**绝不能**留着上一个平台的码。
+
+        否则页面显示着抖音的二维码，实际在登 B 站 —— 扫了就是登不上，
+        而且零报错。这是本模块最危险的一个坑。
+        """
+        from vp_publish import loginweb
+        hub = self._hub()
+        hub.session.platform = "douyin"
+        hub.session.account = "我的抖音"
+        hub.session.qr_path = self._qr("douyin", "我的抖音")
+        hub.session.qr_mtime = 123.0
+        try:
+            out = hub.start("bilibili")
+            self.assertTrue(out["ok"])
+            self.assertFalse(out["reused"])
+            self.assertIsNone(hub.session.qr_path, "旧平台的码被留下来了！")
+            self.assertEqual(hub.session.qr_mtime, 0.0)
+        finally:
+            hub.shutdown()
+
+    def test_page_warns_about_a_stale_qr(self):
+        """页面要能识别「这张码已经过期了」，并且有地方说这句话。
+
+        实测踩到过：页面打开时码已经过了 114 秒，原来会当成正常码显示出来，
+        用户扫了就是「该二维码已过期」——正是要修的那个体验。
+        """
+        from vp_publish import loginweb
+        page = loginweb.PAGE
+        self.assertIn('id="qstale"', page, "没有过期提示的位置")
+        self.assertIn("已经过期", page)
+        # 判断依据必须是服务端给的 qr_age，不能靠页面自己数秒
+        self.assertIn("qr_age", page)
+        self.assertIn("classList", page)
 
     def test_http_token_and_routes(self):
         """没 token 的 API 请求要被挡住；页面本身要能打开。"""

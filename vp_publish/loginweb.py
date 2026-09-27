@@ -111,13 +111,26 @@ class Hub:
         self.headless = headless
         self.lock = threading.Lock()
         self.session = Session()
-        self.log_dir = Path.home() / ".cache" / "vp-publish" / "login"
+        # 跟着 XDG 走：板子上 ~/.cache 和状态目录可能不在一个盘上，
+        # 而且测试里要能圈到临时目录，别往用户家里写。
+        cache = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
+        self.log_dir = Path(cache) / "vp-publish" / "login"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.sau_path = sau.find_sau(cfg)
         self.problem = "" if self.sau_path else sau.sau_problem(cfg)
 
     # ── 子进程 ──────────────────────────────────────────────
-    def _spawn(self, key: str, account: str) -> None:
+    def _spawn(self, key: str, account: str, *, keep_qr: bool = False) -> None:
+        """拉起一次登录。`keep_qr=True` 时保留上一张码继续显示。
+
+        为什么需要 keep_qr：chromium 起来要十几秒，这段时间里页面如果
+        没有码，用户会以为坏了。同一个平台换码时就让旧码继续挂着，
+        新码一到自动替换。
+
+        但**换平台时必须清掉**（keep_qr=False）—— 否则会出现
+        「页面显示抖音的码，实际在登 B 站」这种事，扫了就是登不上，
+        而且零报错。这正是本模块开头警告的那个坑。
+        """
         argv = sau.build_login_argv(self.sau_path, key, account,
                                     headless=self.headless)
         log_path = self.log_dir / f"{key}.log"
@@ -138,14 +151,15 @@ class Hub:
         proc = subprocess.Popen(argv, **kwargs)
 
         s = self.session
+        old_path, old_mtime = s.qr_path, s.qr_mtime
         s.platform = key
         s.account = account
         s.proc = proc
         s.log_path = log_path
         s.log_fh = fh
         s.started_at = time.time()
-        s.qr_path = None
-        s.qr_mtime = 0.0
+        s.qr_path = old_path if keep_qr else None
+        s.qr_mtime = old_mtime if keep_qr else 0.0
         s.exit_code = None
         s.ok = False
         s.note = ""
@@ -190,11 +204,15 @@ class Hub:
                 return {"ok": False, "error": f"认不出平台：{key}"}
             if self.sau_path is None:
                 return {"ok": False, "error": self.problem}
+            # 同一个平台重开 = 换一张码 → 旧码继续挂着，别让页面空十几秒。
+            # 换了平台就绝不能留，不然会显示着 A 平台的码去登 B 平台。
+            same = bool(self.session.active and self.session.platform == key)
             self._kill(self.session.proc)
             self._close_log()
             acct = sau.resolve_account(self.cfg, key, override=account)
-            self._spawn(key, acct)
-            return {"ok": True, "platform": key, "account": acct}
+            self._spawn(key, acct, keep_qr=same)
+            return {"ok": True, "platform": key, "account": acct,
+                    "reused": same}
 
     def stop(self) -> dict:
         with self.lock:
@@ -338,12 +356,21 @@ PAGE = r"""<!doctype html>
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
         padding:18px}
   .qrbox{background:#fff;border-radius:12px;display:flex;align-items:center;
-         justify-content:center;min-height:320px;border:1px dashed var(--line)}
+         justify-content:center;min-height:320px;border:1px dashed var(--line);
+         position:relative}
   .qrbox img{width:320px;height:320px;image-rendering:pixelated;display:none}
   .qrbox.ready img{display:block}
   .qrbox.ready{border-style:solid}
   .ph{color:var(--dim);text-align:center;padding:0 20px;font-size:14px}
   .qrbox.ready .ph{display:none}
+  /* 码已经超过刷新间隔了：灰掉 + 盖一层说明，别让用户去扫一张废码。
+     这是实测踩到的：页面打开时如果码早就过期了，原来会当成正常码显示。 */
+  .qrbox .tip{display:none;position:absolute;inset:0;align-items:center;
+             justify-content:center;text-align:center;padding:0 26px;
+             background:rgba(255,255,255,.88);border-radius:12px;
+             color:var(--warn);font-weight:600;font-size:14px}
+  .qrbox.stale .tip{display:flex}
+  .qrbox.stale img{filter:grayscale(1);opacity:.28}
   .meta{margin-top:14px}
   .status{font-weight:600;display:flex;align-items:center;gap:8px}
   .status .dot{width:9px;height:9px;border-radius:50%;background:var(--dim);
@@ -402,6 +429,7 @@ PAGE = r"""<!doctype html>
       <div class="qrbox" id="qrbox">
         <div class="ph" id="ph">点右边任意一个平台开始</div>
         <img id="qr" alt="登录二维码">
+        <div class="tip" id="qstale">这张码已经过期了，正在换新的…</div>
       </div>
       <div class="meta">
         <div class="status" id="status"><span class="dot"></span><span id="stext">未开始</span></div>
@@ -476,12 +504,27 @@ PAGE = r"""<!doctype html>
 
     // 二维码
     var box = $("qrbox");
+    var ra = st.refresh_after || 0;
     if (st.qr_mtime && st.qr_mtime !== shownQr) {
       shownQr = st.qr_mtime;
       $("qr").src = "/api/qr.png?v=" + st.qr_mtime + "&k=" + encodeURIComponent(K);
-      box.classList.add("ready");
     }
-    if (!st.qr_mtime) { box.classList.remove("ready"); shownQr = 0; }
+    // 「这张码还能不能用」由**服务端算好的 qr_age** 判断，不靠页面自己数秒
+    // —— 页面可能是刚打开的，也可能是睡了一觉的标签页。
+    // 超过刷新间隔（没开自动换就按 120 秒兜底）就当它废了。
+    // 注意这里**不看 status**：换码期间 status 是 starting，但屏幕上挂着的
+    // 那张旧码同样已经废了，照样得盖住。
+    var stale = !!st.qr_mtime && st.qr_age > (ra > 0 ? ra : 120) &&
+                st.status !== "ok";
+    // 只在**真的没有码**时才收起来。换码期间旧码继续挂着：chromium 起来要
+    // 十几秒，中间空着用户会以为坏了。
+    var has = !!(st.qr_mtime || (st.status === "starting" && shownQr));
+    if (st.status === "idle" || st.status === "failed") {
+      has = false; shownQr = 0;
+    }
+    box.classList[has ? "add" : "remove"]("ready");
+    box.classList[(stale && has) ? "add" : "remove"]("stale");
+    var blocked = stale && has;
 
     // 状态
     var s = $("status");
@@ -495,18 +538,22 @@ PAGE = r"""<!doctype html>
     $("stext").textContent = text;
 
     // 倒计时条
-    var ra = st.refresh_after || 0;
     var frac = ra > 0 && st.qr_age ? Math.min(1, st.qr_age / ra) : 0;
-    $("bar").style.width = (st.status === "waiting" ? frac * 100 : 0) + "%";
+    $("bar").style.width = (st.status === "waiting" && !blocked ? frac * 100 : 0) + "%";
 
     // 提示
     var hint = "";
-    if (st.status === "waiting") {
+    if (blocked) {
+      hint = "这张码已经生成 " + Math.round(st.qr_age) + " 秒，多半失效了 —— " +
+             "正在换新的，几秒后会出现；急着要就点「换一张」。";
+    } else if (st.status === "waiting") {
       var left = ra > 0 ? Math.max(0, Math.ceil(ra - st.qr_age)) : 0;
-      hint = $("auto").checked && ra > 0
-        ? "建议在 " + left + " 秒内扫完（到点自动换新码）"
+      hint = ra > 0
+        ? "建议在 " + left + " 秒内扫完（到点会自动换新码）"
         : "二维码已生成 " + Math.round(st.qr_age) + " 秒";
-      if (st.qr_age > 90) { hint += " · 可能已过期，建议点「换一张」"; }
+    } else if (st.status === "starting") {
+      hint = shownQr ? "正在换一张新码，上面这张已经不能用了。"
+                     : "正在拉起浏览器取二维码，一般十几秒。";
     } else if (st.status === "ok") {
       hint = "账号文件已写入：" + st.account_file;
     } else if (st.status === "failed") {
@@ -529,9 +576,9 @@ PAGE = r"""<!doctype html>
     $("log").textContent = st.log_tail || "（还没有日志）";
     curPlat = st.platform;
 
-    // 到期自动换
-    if (!busy && st.status === "waiting" && $("auto").checked && ra > 0 &&
-        st.qr_age > ra) {
+    // 到期自动换。放在服务端不做，是因为**只有有人看着的时候才值得换**
+    // —— 没人看还每 75 秒拉一次 chromium，在板子上是纯浪费。
+    if (!busy && blocked && $("auto").checked && ra > 0) {
       begin(st.platform);
     }
   }
@@ -541,8 +588,14 @@ PAGE = r"""<!doctype html>
     busy = true;
     setBanner("", "");
     post("/api/start", k).then(function(){
-      shownQr = 0;
-      $("qrbox").classList.remove("ready");
+      // 换**同一个平台**时不清图：服务端会把旧码留着，新码到了自动替换，
+      // 中间那十几秒用户至少还能看到东西（灰掉 + 提示已过期）。
+      // 换平台就必须清，不然会显示着 A 平台的码去登 B 平台。
+      if (k !== curPlat) {
+        shownQr = 0;
+        $("qrbox").classList.remove("ready");
+        $("qrbox").classList.remove("stale");
+      }
     }).catch(function(e){
       setBanner("bad", e.message === "unauthorized"
         ? "链接里缺 token —— 请用启动时打印的完整链接打开这个页面。"

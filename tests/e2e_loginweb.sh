@@ -147,6 +147,10 @@ if [ -z "$EXT" ]; then ok "没有任何外部请求（CDN/字体/框架都没引
 else bad "页面里有外部引用：$EXT"; fi
 
 if echo "$HTML" | grep -q 'id="qr"'; then ok "有二维码容器"; else bad "找不到二维码容器"; fi
+# 过期码要有地方说清楚 —— 实测踩到过：页面打开时码已经过期 114 秒，
+# 原来会当成正常码显示出来，用户扫了就是「该二维码已过期」。
+if echo "$HTML" | grep -q 'id="qstale"'; then ok "有「码已过期」的提示位"; else bad "缺过期提示位"; fi
+if echo "$HTML" | grep -q 'qr_age'; then ok "过期判断用的是服务端算好的 qr_age"; else bad "没有 qr_age"; fi
 
 # ── 2. 初始状态 ─────────────────────────────────────────────────
 note "2. 初始状态是 idle，且认得所有平台"
@@ -195,14 +199,38 @@ curl -fsS "$U/api/qr.png" -o "$BASE/got2.png"
 if grep -aq 'douyin/' "$BASE/got2.png"; then ok "仍然给的是抖音的码（没被更新的 B 站码顶掉）"
 else bad "把别的平台的码递出来了！"; fi
 
-# 反过来：只放 B 站的码、登抖音，就该是「还没出码」，而不是拿 B 站的凑数
-rm -f "$BASE/sau/cookies/douyin_我的抖音_login_qrcode_"*.png
+# ── 5b. 同一个平台换一张：旧码要留着 ────────────────────────────
+note "5b. 换一张码时，旧码继续挂着（chromium 起来要十几秒）"
+curl -sS -X POST --data 'douyin' "$U/api/start" -o "$BASE/re.json"
+if grep -q '"reused": *true' "$BASE/re.json"; then ok "认得出这是「换一张」"
+else bad "没识别成换码：$(cat "$BASE/re.json")"; fi
+CODE="$(curl -sS -o "$BASE/got3.png" -w '%{http_code}' "$U/api/qr.png")"
+if [ "$CODE" = 200 ] && grep -aq 'douyin/' "$BASE/got3.png"; then
+  ok "换码期间旧码还在（页面不会空十几秒）"
+else bad "换码期间旧码被清掉了（HTTP $CODE）"; fi
+
+# ── 5c. 换平台：绝不能留上一张 ──────────────────────────────────
+note "5c. 换平台时，上一张码必须清掉"
+rm -f "$BASE/sau/cookies/bilibili_我的B站_login_qrcode_"*.png
 : > "$BASE/sau/cookies/.noqr"          # 让假 sau 这次不出码
-curl -fsS -X POST --data 'douyin' "$U/api/start" >/dev/null
-sleep 0.6
+curl -sS -X POST --data 'bilibili' "$U/api/start" -o "$BASE/re2.json"
+if grep -q '"reused": *false' "$BASE/re2.json"; then ok "认得出这是换平台"
+else bad "把换平台当成换码了：$(cat "$BASE/re2.json")"; fi
+CODE="$(curl -sS -o "$BASE/got4.png" -w '%{http_code}' "$U/api/qr.png")"
+if [ "$CODE" = 404 ]; then ok "抖音的码没被留下来给 B 站用"
+else bad "把抖音的码递给了 B 站（HTTP $CODE）—— 扫了就是登不上！"; fi
 ST="$(curl -fsS "$U/api/state")"
 if echo "$ST" | grep -q '"qr_mtime": *0'; then ok "本平台没码时就说没码，不拿别人的凑"
 else bad "没码却报有码：$(echo "$ST" | head -c 200)"; fi
+
+# 再补一刀：造一张**刚生成的**抖音码（比这次 spawn 还新）。
+# 它在时间上完全"够格"，唯一的问题是**不是这个平台的**。
+"$PY" "$BASE/mkpng.py" douyin 我的抖音 \
+  "$BASE/sau/cookies/douyin_我的抖音_login_qrcode_$(date +%Y%m%d_%H%M%S).png"
+sleep 0.5
+CODE="$(curl -sS -o "$BASE/got5.png" -w '%{http_code}' "$U/api/qr.png")"
+if [ "$CODE" = 404 ]; then ok "刚生成的抖音码也没被 B 站捡走"
+else bad "B 站捡了抖音的码（HTTP $CODE）"; fi
 rm -f "$BASE/sau/cookies/.noqr"
 
 # ── 6. 日志里的方块要被清掉 ─────────────────────────────────────
