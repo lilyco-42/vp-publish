@@ -34,9 +34,13 @@ jobs:
         run: |
           bash -n bootstrap.sh
           bash -n publish-all
+          bash -n tests/e2e_watch.sh
 
       - name: 单元测试
         run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: 端到端演练（假 sau，验证 watch 的跨轮行为）
+        run: bash tests/e2e_watch.sh
 
       - name: 冒烟测试（零依赖路径，不碰网络）
         run: |

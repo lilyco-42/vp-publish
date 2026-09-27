@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from . import __version__, config as config_mod, cover, doctor, meta as meta_mod
-from . import platforms, report, sau, state
+from . import platforms, report, sau, state, watch
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".flv", ".webm", ".m4v", ".ts", ".wmv"}
 
@@ -115,11 +115,31 @@ def build_sub_parser() -> argparse.ArgumentParser:
 
     f = sub.add_parser("forget", help="清掉某个视频的发布记录")
     f.add_argument("videos", nargs="+")
+    f.add_argument("--state", default="",
+                   help="watch 状态文件路径（默认取默认位置，跟 watch 一致）")
+
+    w = sub.add_parser("watch", help="守护模式：盯着目录，出现新视频就自动发")
+    w.add_argument("dirs", nargs="*", help="监视目录（默认取配置的 watch_dirs）")
+    w.add_argument("--interval", type=int, default=30, help="轮询间隔秒数（默认 30）")
+    w.add_argument("--once", action="store_true", help="只扫一轮就退出（测试用）")
+    w.add_argument("--publish-backlog", action="store_true",
+                   help="启动时目录里已有的视频也发出去（默认只登记不发）")
+    w.add_argument("--no-recursive", action="store_true", help="只扫一层目录")
+    w.add_argument("--stable-rounds", type=int, default=2,
+                   help="连续几轮大小不变才认为写完（默认 2）")
+    w.add_argument("--state", default="", help="watch 状态文件路径")
+    w.add_argument("--log", default="", help="同时写日志到这个文件")
+    w.add_argument("--only", default="", help="只发这些平台")
+    w.add_argument("--skip", default="", help="跳过这些平台")
+    w.add_argument("--account", default="", help="强制指定账号名")
+    w.add_argument("--schedule", default="", help='定时发布，格式 "2026-03-24 21:30"')
+    w.add_argument("--dry-run", action="store_true", help="只打印，不真发")
+    w.add_argument("--headed", action="store_true", help="显示浏览器窗口")
 
     return p
 
 
-SUBCOMMANDS = ("doctor", "login", "accounts", "platforms", "init", "forget")
+SUBCOMMANDS = ("doctor", "login", "accounts", "platforms", "init", "forget", "watch")
 
 
 # ── 视频收集 ────────────────────────────────────────────────────
@@ -198,14 +218,176 @@ def resolve_targets(cfg: config_mod.Config, only: str, skip: str,
 
 
 # ── 主流程：发布 ────────────────────────────────────────────────
+class Options:
+    """一次发布的可选参数。
+
+    抽出来是因为 publish_one_video() 要被两个地方调用：
+    命令行的 cmd_publish 和守护式的 cmd_watch。
+    watch 没有 argparse 命名空间，只有一份配置，所以统一成这个结构。
+    """
+
+    def __init__(self, *, title: str = "", desc: str = "", tags: str = "",
+                 cover: str = "", tid: int | None = None, collection: str = "",
+                 playlist: str = "", visibility: str = "", schedule: str = "",
+                 account: str = "", force: bool = False, no_cover: bool = False,
+                 dry_run: bool = False, headed: bool = False, json: bool = False,
+                 quiet: bool = False):
+        self.title = title
+        self.desc = desc
+        self.tags = tags
+        self.cover = cover
+        self.tid = tid
+        self.collection = collection
+        self.playlist = playlist
+        self.visibility = visibility
+        self.schedule = schedule
+        self.account = account
+        self.force = force
+        self.no_cover = no_cover
+        self.dry_run = dry_run
+        self.headed = headed
+        self.json = json
+        self.quiet = quiet
+
+    @classmethod
+    def from_args(cls, args) -> "Options":
+        return cls(
+            title=args.title, desc=args.desc, tags=args.tags, cover=args.cover,
+            tid=args.tid, collection=args.collection, playlist=args.playlist,
+            visibility=args.visibility, schedule=getattr(args, "schedule", ""),
+            account=args.account, force=args.force, no_cover=args.no_cover,
+            dry_run=args.dry_run, headed=args.headed, json=args.json,
+        )
+
+
+def publish_one_video(video: Path, cfg: config_mod.Config, *,
+                      targets: list[str], available: dict[str, list[str]],
+                      sau_path: Path | None, opts: Options,
+                      store: state.Store) -> dict:
+    """发布一个视频到所有目标平台。返回 {rows, statuses, results, ok}。
+
+    这是「发一个视频」的唯一实现。cmd_publish（一次多个视频）和
+    cmd_watch（守护式）都调它 —— 保证两条路径的行为**完全一致**，
+    不会出现「手动发成功、自动发失败」这种诡异差异。
+    """
+    m = meta_mod.load(
+        video,
+        title=opts.title, desc=opts.desc, tags=opts.tags,
+        cover=opts.cover, tid=opts.tid, collection=opts.collection,
+        playlist=opts.playlist, visibility=opts.visibility,
+        schedule=opts.schedule,
+    )
+    if not m.tags and cfg.default_tags:
+        m.tags = list(cfg.default_tags)
+
+    record = store.get(video)
+    ratio_cache: dict[str, Path | None] = {}     # 比例 → 封面文件（跨平台复用）
+    cover_warned: set[str] = set()
+    rows: list[dict] = []
+    statuses: list[str] = []
+    results: list[dict] = []
+    headless = not opts.headed
+    any_fail = False
+
+    for key in targets:
+        plat = platforms.BY_KEY[key]
+        account = opts.account or sau.pick_account(cfg, key, available)
+
+        if record.is_ok(key) and not opts.force:
+            rows.append(report.line_for(plat.label, account, report.SKIP, 0.0,
+                                        "已经发过了（--force 可重发）"))
+            statuses.append(report.SKIP)
+            continue
+
+        # 标题按平台裁剪
+        title, warns = meta_mod.adapt_title(m.title, plat)
+        for w in warns:
+            warn(w)
+        if key in cfg.title_max and len(title) > cfg.title_max[key]:
+            title = title[: cfg.title_max[key] - 1] + "…"
+        tags = meta_mod.adapt_tags(m.tags, plat)
+
+        # 封面：先算这个平台要哪些比例，再按**比例**取缓存
+        slots = cover.ratios_for(key, plat.caps)
+        covers: dict[str, Path] = {}
+        if m.cover and Path(m.cover).is_file():
+            # 用户自己给了封面 → 直接用，不做任何裁剪（尊重用户）
+            for slot in slots:
+                covers[slot] = Path(m.cover)
+        elif cfg.cover and not opts.no_cover:
+            for ratio in set(slots.values()):
+                if ratio not in ratio_cache:
+                    res = cover.extract(video, cfg.resolve_cover_dir(),
+                                        ratio=ratio, at=cfg.cover_at)
+                    ratio_cache[ratio] = res.path
+                    if res.path is None and res.reason and res.reason not in cover_warned:
+                        cover_warned.add(res.reason)
+                        warn(f"封面：{res.reason}")
+                got = ratio_cache[ratio]
+                if got:
+                    for slot, want in slots.items():
+                        if want == ratio:
+                            covers[slot] = got
+
+        # 本次的元数据副本（标题/标签已按平台适配）
+        use = meta_mod.Meta(**{**m.to_dict(), "title": title, "tags": tags})
+        use.tid = m.tid if m.tid is not None else cfg.tid
+
+        if not opts.quiet:
+            say(f"  → {plat.label}（账号 {account}）…")
+
+        res = sau.upload(sau_path, plat, account, video, use, covers, cfg,
+                         headless=headless, dry_run=opts.dry_run)
+
+        if opts.dry_run:
+            status, note = report.DRY, ""
+        elif res.ok:
+            status, note = report.OK, ""
+        else:
+            status = report.FAIL
+            note = res.reason or res.tail or f"退出码 {res.code}"
+            any_fail = True
+
+        if not opts.dry_run:
+            record.mark(key, state.OK if res.ok else state.FAIL, note=note[:200])
+
+        rows.append(report.line_for(plat.label, account, status, res.elapsed,
+                                    report.truncate(note, 60)))
+        statuses.append(status)
+        results.append({
+            "video": str(video), "platform": key, "label": plat.label,
+            "account": account, "status": status,
+            "elapsed": round(res.elapsed, 1), "title": title,
+            "note": note, "argv": res.argv,
+        })
+
+        if not opts.quiet:
+            mark = report.STATUS_MARK.get(status, "?")
+            extra = f"  {note}" if note and not opts.dry_run else ""
+            say(f"    {mark} {report.STATUS_TEXT.get(status, status)}"
+                f"（{res.elapsed:.0f}s）{extra}")
+            if opts.dry_run:
+                # 命令太长，塞进表格会挤爆——单独一行更好读
+                say(f"      $ {' '.join(res.argv)}")
+
+    if not opts.dry_run:
+        store.put(video, record)
+
+    return {"rows": rows, "statuses": statuses, "results": results,
+            "ok": not any_fail}
+
+
 def cmd_publish(args, cfg: config_mod.Config) -> int:
     videos = collect_videos(args.videos)
     if not videos:
         die("没给视频。用法：vp-publish final.mp4\n"
             "  看看有哪些平台可用：vp-publish doctor")
 
+    opts = Options.from_args(args)
+    opts.schedule = validate_schedule(opts.schedule)
+
     sau_path = sau.find_sau(cfg)
-    if sau_path is None and not args.dry_run:
+    if sau_path is None and not opts.dry_run:
         die(sau.sau_problem(cfg))
 
     available = sau.discover_accounts(cfg)
@@ -216,20 +398,18 @@ def cmd_publish(args, cfg: config_mod.Config) -> int:
             f"  先登录一个：vp-publish login douyin\n"
             f"  或者体检看看：vp-publish doctor")
 
-    schedule = validate_schedule(args.schedule)
-    headless = not args.headed
     store = state.Store()
     started = time.time()
 
-    if not args.json:
+    if not opts.json:
         say(f"目标平台（{len(targets)}）：" +
             "、".join(platforms.BY_KEY[t].label for t in targets))
         say(f"视频（{len(videos)}）：" + "、".join(v.name for v in videos))
-        if schedule:
-            say(f"定时发布：{schedule}")
+        if opts.schedule:
+            say(f"定时发布：{opts.schedule}")
         for n in notes:
             say(f"  · {n}")
-        if args.dry_run:
+        if opts.dry_run:
             say("  · dry-run 模式，不会真发")
         say()
 
@@ -239,126 +419,22 @@ def cmd_publish(args, cfg: config_mod.Config) -> int:
     any_fail = False
 
     for video in videos:
-        if not args.json and len(videos) > 1:
+        if not opts.json and len(videos) > 1:
             say(f"── {video.name} ──")
-
-        m = meta_mod.load(
-            video,
-            title=args.title, desc=args.desc, tags=args.tags,
-            cover=args.cover, tid=args.tid, collection=args.collection,
-            playlist=args.playlist, visibility=args.visibility,
-            schedule=schedule,
-        )
-        if not m.tags and cfg.default_tags:
-            m.tags = list(cfg.default_tags)
-
-        record = store.get(video)
-        ratio_cache: dict[str, Path | None] = {}     # 比例 → 封面文件（跨平台复用）
-        cover_warned: set[str] = set()
-        video_rows: list[dict] = []
-
-        for key in targets:
-            plat = platforms.BY_KEY[key]
-            account = args.account or sau.pick_account(cfg, key, available)
-
-            if record.is_ok(key) and not args.force:
-                row = report.line_for(plat.label, account, report.SKIP, 0.0,
-                                      "已经发过了（--force 可重发）")
-                video_rows.append(row)
-                all_status.append(report.SKIP)
-                continue
-
-            # 标题按平台裁剪
-            title, warns = meta_mod.adapt_title(m.title, plat)
-            for w in warns:
-                warn(w)
-            if key in cfg.title_max and len(title) > cfg.title_max[key]:
-                title = title[: cfg.title_max[key] - 1] + "…"
-            tags = meta_mod.adapt_tags(m.tags, plat)
-
-            # 封面：先算这个平台要哪些比例，再按**比例**取缓存
-            slots = cover.ratios_for(key, plat.caps)
-            covers: dict[str, Path] = {}
-            if m.cover and Path(m.cover).is_file():
-                # 用户自己给了封面 → 直接用，不做任何裁剪（尊重用户）
-                for slot in slots:
-                    covers[slot] = Path(m.cover)
-            elif cfg.cover and not args.no_cover:
-                for ratio in set(slots.values()):
-                    if ratio not in ratio_cache:
-                        res = cover.extract(video, cfg.resolve_cover_dir(),
-                                            ratio=ratio, at=cfg.cover_at)
-                        ratio_cache[ratio] = res.path
-                        if res.path is None and res.reason and res.reason not in cover_warned:
-                            cover_warned.add(res.reason)
-                            warn(f"封面：{res.reason}")
-                    got = ratio_cache[ratio]
-                    if got:
-                        for slot, want in slots.items():
-                            if want == ratio:
-                                covers[slot] = got
-
-            # 本次的元数据副本（标题/标签已按平台适配）
-            use = meta_mod.Meta(**{**m.to_dict(), "title": title, "tags": tags})
-            use.tid = m.tid if m.tid is not None else cfg.tid
-
-            if not args.json:
-                say(f"  → {plat.label}（账号 {account}）…")
-
-            res = sau.upload(sau_path, plat, account, video, use, covers, cfg,
-                             headless=headless, dry_run=args.dry_run)
-
-            if args.dry_run:
-                status = report.DRY
-                note = ""
-            elif res.ok:
-                status = report.OK
-                note = ""
-            else:
-                status = report.FAIL
-                note = res.reason or res.tail or f"退出码 {res.code}"
-                any_fail = True
-
-            if not args.dry_run:
-                record.mark(key, state.OK if res.ok else state.FAIL, note=note[:200])
-
-            video_rows.append(report.line_for(
-                plat.label, account, status, res.elapsed,
-                report.truncate(note, 60)))
-            all_status.append(status)
-
-            json_out.append({
-                "video": str(video),
-                "platform": key,
-                "label": plat.label,
-                "account": account,
-                "status": status,
-                "elapsed": round(res.elapsed, 1),
-                "title": title,
-                "note": note,
-                "argv": res.argv,
-            })
-
-            if not args.json:
-                mark = report.STATUS_MARK.get(status, "?")
-                extra = f"  {note}" if note and not args.dry_run else ""
-                say(f"    {mark} {report.STATUS_TEXT.get(status, status)}"
-                    f"（{res.elapsed:.0f}s）{extra}")
-                if args.dry_run:
-                    # 命令太长，塞进表格会挤爆——单独一行更好读
-                    say(f"      $ {' '.join(res.argv)}")
-
-        if not args.dry_run:
-            store.put(video, record)
-        all_rows += video_rows
-        if not args.json:
+        out = publish_one_video(video, cfg, targets=targets, available=available,
+                                sau_path=sau_path, opts=opts, store=store)
+        all_rows += out["rows"]
+        all_status += out["statuses"]
+        json_out += out["results"]
+        any_fail = any_fail or not out["ok"]
+        if not opts.json:
             say()
 
-    if not args.dry_run:
+    if not opts.dry_run:
         store.prune()
         store.save()
 
-    if args.json:
+    if opts.json:
         say(json.dumps({
             "ok": not any_fail,
             "videos": [str(v) for v in videos],
@@ -388,6 +464,167 @@ def cmd_publish(args, cfg: config_mod.Config) -> int:
 
 
 # ── 子命令 ──────────────────────────────────────────────────────
+def cmd_watch(args, cfg: config_mod.Config) -> int:
+    """守护模式：盯着目录，出现新视频就自动发。
+
+    存在的理由：vp-pipeline 每天定时产出 4 条视频，但发布那一环是空的——
+    整条「话题 → 成片 → 发布」的自动化断在最后一步。
+    """
+    dirs = [Path(d).expanduser() for d in args.dirs] or \
+        [Path(p).expanduser() for p in (cfg.watch_dirs or ["~/vp/videos"])]
+    dirs = [d for d in dirs if d.is_dir()]
+    if not dirs:
+        die("没有可监视的目录。\n"
+            "  用法：vp-publish watch ~/vp/videos\n"
+            "  或者配到 config 的 watch_dirs")
+
+    sau_path = sau.find_sau(cfg)
+    if sau_path is None:
+        die(sau.sau_problem(cfg))
+
+    available = sau.discover_accounts(cfg)
+    targets, notes = resolve_targets(cfg, args.only, args.skip, available)
+    if not targets:
+        die("没有可发的平台 —— 守护起来也没用。\n"
+            f"  已登录：{', '.join(available) or '（一个都没有）'}\n"
+            "  先登录：vp-publish login douyin")
+
+    opts = Options(
+        account=args.account, force=False, dry_run=args.dry_run,
+        headed=args.headed, quiet=True, schedule=args.schedule,
+    )
+    if opts.schedule:
+        opts.schedule = validate_schedule(opts.schedule)
+
+    store = state.Store()
+    watch_path = args.state or (config_mod.default_state_dir() / "watch.json")
+    wstore = watch.Store(Path(watch_path).expanduser())
+    logfile = Path(args.log).expanduser() if args.log else None
+    if not wstore.state.started_at:
+        wstore.state.started_at = time.time()
+        wstore.save()
+
+    def log(line: str) -> None:
+        print(line, flush=True)
+        if logfile:
+            logfile.parent.mkdir(parents=True, exist_ok=True)
+            with logfile.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+
+    log(f"vp-publish watch 启动")
+    log(f"  监视目录：{'、'.join(str(d) for d in dirs)}")
+    log(f"  目标平台（{len(targets)}）：" +
+        "、".join(platforms.BY_KEY[t].label for t in targets))
+    log(f"  轮询间隔：{args.interval}s")
+    log(f"  状态文件：{wstore.path}")
+    for n in notes:
+        log(f"  · {n}")
+    if args.dry_run:
+        log("  · dry-run 模式：只打印要执行什么，不真发（也不会写发布记录）")
+    if not args.publish_backlog and not wstore.state.baseline_done:
+        log("  · 首次启动：已存在的视频只登记、不发布（要发库存加 --publish-backlog）")
+    log("")
+
+    round_no = 0
+    while True:
+        round_no += 1
+        first_round = not wstore.state.baseline_done
+        try:
+            videos = watch.scan(dirs, recursive=not args.no_recursive)
+        except Exception as exc:                    # pragma: no cover - 环境相关
+            log(f"[{time.strftime('%H:%M:%S')}] 扫描出错：{exc}")
+            videos = []
+
+        published = failed = skipped = ready_n = 0
+        live: set[str] = set()
+
+        for video in videos:
+            key = watch.key_for(video)
+            live.add(key)
+
+            # 处理过的（成功或失败）就别再碰它。
+            # 这个判断必须在计数之前：否则每轮都会把已发布的视频重新
+            # 数成「就绪」，日志会被刷满。
+            if key in wstore.state.published:
+                continue
+
+            # 第一次见到它就登记。首轮扫描时就在的 = 库存。
+            seen = watch.register(wstore.state, video, baseline=first_round)
+
+            ok, why = watch.ready_to_publish(video, seen,
+                                             min_stable_rounds=args.stable_rounds)
+            if not ok:
+                if not seen.logged:
+                    seen.logged = True
+                    log(f"  等待：{video.name} —— {why}")
+                continue
+            ready_n += 1
+
+            # 库存保护：开始看之前就在的文件，只登记、不发布
+            if seen.baseline and not args.publish_backlog:
+                if not args.dry_run:
+                    wstore.state.published[key] = \
+                        f"baseline-skip@{time.strftime('%F %T')}"
+                skipped += 1
+                log(f"  跳过库存：{video.name}（启动时已存在，未发布）")
+                continue
+
+            log(f"  发布：{video.name}")
+            try:
+                out = publish_one_video(
+                    video, cfg, targets=targets, available=available,
+                    sau_path=sau_path, opts=opts, store=store)
+            except Exception as exc:                # pragma: no cover - 环境相关
+                failed += 1
+                log(f"    异常：{type(exc).__name__}: {exc}")
+                if not args.dry_run:
+                    wstore.state.published[key] = \
+                        f"error@{time.strftime('%F %T')}"
+                continue
+
+            for row in out["rows"]:
+                log(f"    {row['platform']}  {row['result']}"
+                    + (f"  {row['note']}" if row["note"] else ""))
+            if args.dry_run:
+                # 试运行必须能看见「到底要执行什么」，否则等于没试
+                for res in out["results"]:
+                    log(f"      $ {' '.join(res['argv'])}")
+            if out["ok"]:
+                published += 1
+                if not args.dry_run:
+                    wstore.state.published[key] = f"ok@{time.strftime('%F %T')}"
+            else:
+                failed += 1
+                if not args.dry_run:
+                    wstore.state.published[key] = \
+                        f"failed@{time.strftime('%F %T')}"
+                log("    ↑ 有平台失败；这条不再自动重试，"
+                    "要重发先 vp-publish forget 再等下一轮")
+
+        # 清掉已经不存在的文件的记录，免得状态文件无限膨胀。
+        # 用 exists() 兜一层：目录临时读不到时不要误删。
+        for stale in [k for k in wstore.state.seen if k not in live]:
+            if not Path(stale).exists():
+                wstore.state.seen.pop(stale, None)
+
+        if not wstore.state.baseline_done:
+            wstore.state.baseline_done = True
+
+        if not args.dry_run:
+            store.prune()
+            store.save()
+        wstore.save()
+
+        # 只在有动静时打印，免得日志被「扫描 3」刷满
+        if published or failed or round_no == 1 or ready_n:
+            log(watch.describe_round(round_no, len(videos), ready_n,
+                                     published, failed, skipped))
+
+        if args.once:
+            return 1 if failed else 0
+        time.sleep(max(1, args.interval))
+
+
 def cmd_doctor(args, cfg: config_mod.Config) -> int:
     only: list[str] = []
     if args.only:
@@ -547,16 +784,35 @@ def cmd_init(args, cfg: config_mod.Config) -> int:
 
 
 def cmd_forget(args, cfg: config_mod.Config) -> int:
+    """清掉发布记录，让视频可以被重发。
+
+    **两份记录都要清**：一份是「哪个视频发到哪个平台了」（state.Store），
+    另一份是 watch 模式自己的「这个文件处理过了」（watch.Store）。
+    只清一份的话，README 里写的「forget 之后下一轮自然会捡起来」
+    在 watch 模式下就不成立 —— 实测踩到过。
+    """
     store = state.Store()
+    watch_path = Path(getattr(args, "state", "") or
+                      (config_mod.default_state_dir() / "watch.json")).expanduser()
+    wstore = watch.Store(watch_path) if watch_path.is_file() else None
+
     n = 0
     for item in args.videos:
-        if store.forget(Path(item).expanduser()):
+        path = Path(item).expanduser()
+        hit = store.forget(path)
+        if wstore is not None and watch.forget(wstore.state, path):
+            hit = True
+        if hit:
             n += 1
             say(f"✓ 已清掉记录：{item}")
         else:
             say(f"· 没有记录：{item}")
+
     if n:
         store.save()
+        if wstore is not None:
+            wstore.save()
+            say(f"  （watch 状态也清了：{watch_path}）")
     return 0
 
 
@@ -572,6 +828,7 @@ def main(argv: list[str] | None = None) -> int:
         "platforms": cmd_platforms,
         "init": cmd_init,
         "forget": cmd_forget,
+        "watch": cmd_watch,
     }
 
     # 第一个参数是已知子命令 → 走子命令；否则整个 argv 当发布参数。

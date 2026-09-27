@@ -130,6 +130,67 @@ ln -s "$PWD/vp-publish" ~/bin/vp-publish
 ./vp-publish v.mp4 --json
 ```
 
+### 守护模式：新视频自动发（`watch`）
+
+这是**把 vp-pipeline 的「话题 → 成片 → 发布」补完整**的那一环。
+流水线每天定时产出视频，但发布得靠人记得去点 —— watch 模式把它接上：
+
+```bash
+./vp-publish watch ~/vp/videos           # 盯着目录，出现新视频就自动发
+./vp-publish watch                       # 目录不写就用配置里的 watch_dirs
+```
+
+它每 30 秒扫一次目录，发现**写完了**的新视频就发到所有已登录平台，
+并把结果记进状态文件。跑成常驻服务：
+
+```bash
+# systemd 用户服务（推荐，重启后自动拉起）
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/vp-publish-watch.service <<'EOF'
+[Unit]
+Description=vp-publish watch
+After=network-online.target
+
+[Service]
+ExecStart=%h/vp-publish/vp-publish watch %h/vp/videos --log %h/vp-publish/watch.log
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now vp-publish-watch
+loginctl enable-linger $USER          # 没登录也跑（板子重启后有效）
+```
+
+**三个关键设计**（都是踩过才加的，改代码前先看）：
+
+| 行为 | 为什么 |
+|---|---|
+| **连续 2 轮大小不变**才认为写完 | 正在写入的视频会先出现半截文件。只判「文件存在」会把半截视频发出去，而且要等平台审核失败才发现。旁边的 `.json` 元数据没写完也一样等。 |
+| **首次启动只登记、不发布** | 如果目录里存了 50 条老视频，一启动全发出去是灾难。要发库存得显式 `--publish-backlog`。 |
+| **失败不自动重试** | 一条坏视频不该把后面全部堵住，也不该在平台侧反复触发风控。要重发：`./vp-publish forget <视频>`，下一轮自然会捡起来。 |
+
+常用参数：
+
+```bash
+./vp-publish watch ~/vp/videos --once            # 只扫一轮（调试用）
+./vp-publish watch ~/vp/videos --dry-run         # 看会发什么，不真发
+./vp-publish watch ~/vp/videos --publish-backlog # 连库存一起发
+./vp-publish watch ~/vp/videos --interval 60     # 轮询间隔
+./vp-publish watch ~/vp/videos --stable-rounds 3 # 更保守：稳定 3 轮才发
+./vp-publish watch ~/vp/videos --only 抖音,b站   # 只发指定平台
+./vp-publish watch ~/vp/videos --log watch.log   # 同时写日志文件
+```
+
+状态文件在 `~/.local/state/vp-publish/watch.json`（`--state` 可改）。
+它和发布记录（`records.json`）是**两份**：一份记「文件写完了没」，
+一份记「发到哪个平台了」。想彻底重来就删掉它们。
+
+> 为什么不做成「流水线跑完调一次 publish」？因为那样就绑死了视频必须由流水线产出。
+> 盯着目录更松：流水线产的、你手工拷的、scp 过来的，一视同仁。
+
 ### 体检
 
 ```bash
@@ -427,6 +488,27 @@ sau 升级了也不连累它。
     有些工具（sau 的短信验证码提示）会检查 `sys.stdin.isatty()`，
     没有伪终端就走非交互分支。
 
+20. **watch 里「已处理过」的判断必须放在计数之前**。两个后果：
+    ① 每轮都会把已发布的视频重新数成「就绪」，日志被 `扫描 N` 刷满；
+    ② `--dry-run` 会把 `published` 状态写进状态文件 —— 试运行一次之后，
+       真跑起来就一条都不发了（全都「已处理」）。所以 dry-run 只打印、不落盘。
+
+21. **库存保护必须按文件记，不能用一个全局开关**。这是本项目最凶的一个 bug：
+    文件要「连续 2 轮大小不变」才算写完，所以第一轮扫描时**所有老视频都还没就绪**；
+    而如果「首次启动」是个全局标志，它会在第一轮结束时就翻过去 ——
+    于是第二轮老视频集体变成「就绪」，保护却已经关了，**整个目录的存货被一次性发出去**。
+    正确做法：在**第一次见到某个文件**时就把「它当时是否已存在」记在这个文件头上。
+
+22. **`forget` 必须把两份记录都清掉**。发布记录有两份：`state.Store`（发到哪个平台了）
+    和 `watch.Store`（这个文件处理过了）。只清一份的话，README 里承诺的
+    「forget 之后下一轮自然会捡起来」在 watch 模式下不成立。
+    另外 `forget` 和 `watch` 必须认同一个 `--state`，否则自定义状态文件后就清不到。
+
+23. **别指望从子进程的 stdout 判断「到底调没调 sau」**。上传走的是
+    `capture_output=True`，子进程输出全被吞掉。写端到端测试时要让假 sau
+    **写一个调用日志文件**，再从日志判断 —— 第一版 e2e 就是因为 grep stdout
+    而全线假绿。
+
 ---
 
 ## 目录结构
@@ -444,10 +526,12 @@ vp-publish/
 │   ├── cover.py               # ffmpeg 抽帧 + 按比例裁剪
 │   ├── doctor.py              # 体检
 │   ├── state.py               # 幂等记录
+│   ├── watch.py               # 守护模式：等文件写完、库存保护、失败不重试
 │   ├── config.py              # 配置（零依赖 JSON）
 │   └── report.py              # 表格渲染（含中文宽度）
 └── tests/
-    ├── test_vp_publish.py     # 58 项单元测试
+    ├── test_vp_publish.py     # 77 项单元测试
+    ├── e2e_watch.sh           # watch 跨轮行为演练（假 sau）
     ├── reach_probe.py         # 实测各平台可达性
     └── reach_proxy.py         # 实测 YouTube 走代理
 ```
@@ -457,12 +541,18 @@ vp-publish/
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v   # 77 项单元测试
+bash tests/e2e_watch.sh                    # 端到端演练（假 sau，几秒跑完）
 ```
 
-58 项，覆盖平台别名解析、argv 组装、元数据推导、标题裁剪、
-封面比例计算、账号发现、cookie 过期估算、中文表格对齐、状态幂等，
-以及二维码路径解析（防第 16/17 条坑回归）。
+单元测试覆盖平台别名解析、argv 组装、元数据推导、标题裁剪、封面比例计算、
+账号发现、cookie 过期估算、中文表格对齐、状态幂等，以及二维码路径解析
+（防第 16/17 条坑回归）。
+
+`tests/e2e_watch.sh` 是**跨轮**行为的演练 —— watch 的坑全在「第 N 轮和第 N+1 轮
+之间」，单测覆盖不到：库存保护、等文件写完、幂等、失败不重试、dry-run 不脏状态、
+forget 后能重发。它用假 sau，不碰网络、不发任何东西，**CI 里也跑**。
+第 21 条坑就是它抓出来的。
 
 不覆盖「真实上传」——那个需要人扫码，见「实测数据」一节。
 
@@ -478,6 +568,15 @@ vp-publish 把这一层独立出来了，vp-pipeline 的发布步骤可以直接
 ```bash
 ./vp-publish "$VIDEO" --json
 ```
+
+但更省事的做法是**根本不改流水线** —— 直接让 watch 模式盯着它的产物目录：
+
+```bash
+./vp-publish watch ~/vp/videos
+```
+
+这样流水线只管生产，发布交给守护进程。两边解耦：流水线改目录结构、
+换成别的工具产出视频，发布这侧都不用动。
 
 好处：发布逻辑可以单独升级、单独测试，不用碰整条流水线。
 

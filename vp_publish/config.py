@@ -62,6 +62,8 @@ class Config:
     title_max: dict[str, int] = field(default_factory=dict)
     timeout: int = 900                  # 单平台上传超时（秒）
     retries: int = 0                    # 单平台失败重试次数
+    # watch 模式默认监视哪些目录（vp-pipeline 的产物目录就是 ~/vp/videos）
+    watch_dirs: list[str] = field(default_factory=list)
     path: Path = field(default_factory=default_config_path)
 
     def resolve_cover_dir(self) -> Path:
@@ -121,18 +123,23 @@ def load(path: Path | None = None) -> Config:
         cfg.timeout = int(raw["timeout"])
     if isinstance(raw.get("retries"), (int, float)) and raw["retries"] >= 0:
         cfg.retries = int(raw["retries"])
+    if isinstance(raw.get("watch_dirs"), list):
+        cfg.watch_dirs = [str(d) for d in raw["watch_dirs"] if str(d).strip()]
 
     return cfg
 
 
 TEMPLATE = {
-    "_说明": "vp-publish 配置。所有字段都可省略；省略即用默认值。",
+    "_说明": [
+        "vp-publish 配置。所有字段都可省略；省略即用默认值。",
+        "sau.accounts 是「平台 → 账号名」，留空则自动从 ~/sau/cookies/ 发现。",
+        "watch_dirs 是 watch 模式默认监视的目录（不写就用 ~/vp/videos）。",
+    ],
     "sau": {
         "root": "~/sau",
         "bin": "~/sau/.venv/bin/sau",
         "headless": True,
         "accounts": {
-            "_说明": "平台 → 账号名。留空则自动从 ~/sau/cookies/ 发现。",
             "douyin": "我的抖音",
             "xiaohongshu": "我的小红书",
             "bilibili": "我的B站"
@@ -145,7 +152,8 @@ TEMPLATE = {
     "cover": True,
     "cover_at": 1.0,
     "timeout": 900,
-    "retries": 0
+    "retries": 0,
+    "watch_dirs": ["~/vp/videos"]
 }
 
 

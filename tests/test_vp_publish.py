@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sys
@@ -530,6 +531,255 @@ class TestConfig(unittest.TestCase):
             p.write_text("{ broken", encoding="utf-8")
             cfg = config_mod.load(p)
             self.assertEqual(cfg.tid, 171)
+
+    def test_watch_dirs_parsed(self):
+        from vp_publish import config as config_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "c.json"
+            p.write_text(json.dumps({"watch_dirs": ["~/vp/videos", "", "  "]}),
+                         encoding="utf-8")
+            self.assertEqual(config_mod.load(p).watch_dirs, ["~/vp/videos"])
+
+    def test_template_is_loadable_and_clean(self):
+        """模板必须能原样被 load 回来，而且不能混进伪键。
+
+        踩过的坑：accounts 里原本塞了一句 "_说明"，它会被当成一个叫
+        「_说明」的平台账号解析进去。
+        """
+        from vp_publish import config as config_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "c.json"
+            p.write_text(json.dumps(config_mod.TEMPLATE, ensure_ascii=False),
+                         encoding="utf-8")
+            cfg = config_mod.load(p)
+            self.assertNotIn("_说明", cfg.sau.accounts)
+            self.assertEqual(set(cfg.sau.accounts), {"douyin", "xiaohongshu", "bilibili"})
+            self.assertEqual(cfg.watch_dirs, ["~/vp/videos"])
+            # 模板写出来的文件也要能被 write_template → load 走通
+            out = Path(tmp) / "sub" / "config.json"
+            config_mod.write_template(out)
+            self.assertTrue(config_mod.load(out).cover)
+
+
+# ── watch 守护模式 ───────────────────────────────────────────────
+class TestWatchReady(unittest.TestCase):
+    """ready_to_publish 的稳定性判定。
+
+    这是 watch 模式最要紧的一条逻辑：正在写入的视频会先出现一个半截文件，
+    这时候发出去就是一条坏视频（而且要等平台审核失败才发现）。
+    所以「文件存在」不够，必须「连续 N 轮大小不变」。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _make(self, name="v.mp4", size=1000) -> Path:
+        p = self.dir / name
+        p.write_bytes(b"x" * size)
+        return p
+
+    def test_zero_byte_is_not_ready(self):
+        from vp_publish import watch
+        p = self._make(size=0)
+        ok, why = watch.ready_to_publish(p, watch.Seen())
+        self.assertFalse(ok)
+        self.assertIn("0 字节", why)
+
+    def test_growing_file_never_ready_until_stable(self):
+        from vp_publish import watch
+        p = self._make(size=1000)
+        seen = watch.Seen()
+
+        ok, why = watch.ready_to_publish(p, seen)
+        self.assertFalse(ok, "第一次见到就该等下一轮")
+        self.assertIn("还在变", why)
+
+        # 模拟「流水线还在写」：大小又变了 → 计数必须重置
+        p.write_bytes(b"x" * 2000)
+        ok, why = watch.ready_to_publish(p, seen)
+        self.assertFalse(ok)
+        self.assertEqual(seen.stable_rounds, 1, "大小变了要把稳定计数清零")
+        self.assertIn("2000", why)
+
+        # 大小不动了 → 稳定 2 轮 → 可以发
+        ok, why = watch.ready_to_publish(p, seen)
+        self.assertTrue(ok, f"应该就绪了，实际：{why}")
+        self.assertEqual(why, "")
+
+    def test_min_stable_rounds_is_configurable(self):
+        from vp_publish import watch
+        p = self._make()
+        seen = watch.Seen()
+        self.assertFalse(watch.ready_to_publish(p, seen, min_stable_rounds=3)[0])
+        ok, why = watch.ready_to_publish(p, seen, min_stable_rounds=3)
+        self.assertFalse(ok)
+        self.assertIn("2/3", why)
+        self.assertTrue(watch.ready_to_publish(p, seen, min_stable_rounds=3)[0])
+
+    def test_incomplete_sidecar_blocks(self):
+        """视频写完了，但旁边的 .json 元数据还是半截 → 再等等。
+
+        不等的话会拿半截 JSON 去解析，标题/标签就丢了。
+        """
+        from vp_publish import watch
+        p = self._make()
+        (self.dir / "v.json").write_text('{"title": "还没写完', encoding="utf-8")
+        seen = watch.Seen()
+        watch.ready_to_publish(p, seen)
+        ok, why = watch.ready_to_publish(p, seen)
+        self.assertFalse(ok)
+        self.assertIn("不是完整 JSON", why)
+
+        # 流水线写完了 → 放行
+        (self.dir / "v.json").write_text('{"title": "写完了"}', encoding="utf-8")
+        ok, _ = watch.ready_to_publish(p, seen)
+        self.assertTrue(ok)
+
+    def test_missing_file_reports_gracefully(self):
+        from vp_publish import watch
+        ok, why = watch.ready_to_publish(self.dir / "gone.mp4", watch.Seen())
+        self.assertFalse(ok)
+        self.assertIn("stat 失败", why)
+
+
+class TestWatchScan(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_skips_hidden_and_partials(self):
+        from vp_publish import watch
+        (self.dir / "good.mp4").write_bytes(b"x")
+        (self.dir / "movie.MP4").write_bytes(b"x")          # 大写后缀要认
+        (self.dir / ".hidden.mp4").write_bytes(b"x")
+        (self.dir / "writing.mp4.part").write_bytes(b"x")
+        (self.dir / "downloading.mp4.crdownload").write_bytes(b"x")
+        (self.dir / "note.txt").write_bytes(b"x")
+        names = [p.name for p in watch.scan([self.dir])]
+        self.assertEqual(names, ["good.mp4", "movie.MP4"])
+
+    def test_recursive_flag(self):
+        from vp_publish import watch
+        sub = self.dir / "2026-09-27"
+        sub.mkdir()
+        (sub / "deep.mp4").write_bytes(b"x")
+        self.assertEqual(len(watch.scan([self.dir], recursive=True)), 1)
+        self.assertEqual(len(watch.scan([self.dir], recursive=False)), 0)
+
+    def test_missing_dir_is_not_fatal(self):
+        from vp_publish import watch
+        self.assertEqual(watch.scan([self.dir / "nope"]), [])
+
+
+class TestWatchState(unittest.TestCase):
+    def test_roundtrip(self):
+        from vp_publish import watch
+        st = watch.WatchState(started_at=1.5, baseline_done=True,
+                              published={"/a.mp4": "ok@2026-09-27 10:00"})
+        st.seen["/a.mp4"] = watch.Seen(size=123, stable_rounds=2, logged=True,
+                                       baseline=True)
+        back = watch.WatchState.from_json(st.to_json())
+        self.assertTrue(back.baseline_done)
+        self.assertEqual(back.published["/a.mp4"], "ok@2026-09-27 10:00")
+        self.assertEqual(back.seen["/a.mp4"].size, 123)
+        self.assertTrue(back.seen["/a.mp4"].logged)
+        self.assertTrue(back.seen["/a.mp4"].baseline)
+
+    def test_register_keeps_first_sighting(self):
+        """baseline 由**第一次**见到它时决定，之后不再变。
+
+        这条是防回归的核心：库存保护如果写成全局开关，就会因为
+        「文件要 2 轮才算写完」而失效 —— 第二轮库存全变成就绪时，
+        全局开关已经翻过去了，于是整批发出去。
+        """
+        from vp_publish import watch
+        st = watch.WatchState()
+        seen = watch.register(st, Path("/tmp/old.mp4"), baseline=True)
+        self.assertTrue(seen.baseline)
+        # 第二轮再登记（这次 baseline=False）不能把它洗白
+        again = watch.register(st, Path("/tmp/old.mp4"), baseline=False)
+        self.assertIs(again, seen)
+        self.assertTrue(again.baseline)
+
+        new = watch.register(st, Path("/tmp/new.mp4"), baseline=False)
+        self.assertFalse(new.baseline)
+
+    def test_forget_drops_both_records(self):
+        from vp_publish import watch
+        st = watch.WatchState()
+        p = Path("/tmp/x.mp4")
+        watch.register(st, p, baseline=True)
+        st.published[watch.key_for(p)] = "ok@t"
+        self.assertTrue(watch.forget(st, p))
+        self.assertNotIn(watch.key_for(p), st.seen)
+        self.assertNotIn(watch.key_for(p), st.published)
+        self.assertFalse(watch.forget(st, p), "清第二次应该报「没有记录」")
+
+    def test_store_persists_and_survives_garbage(self):
+        from vp_publish import watch
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "watch.json"
+            store = watch.Store(p)
+            self.assertFalse(store.state.baseline_done)
+            store.state.baseline_done = True
+            store.state.published["/x.mp4"] = "ok@t"
+            store.save()
+
+            again = watch.Store(p)
+            self.assertTrue(again.state.baseline_done)
+            self.assertIn("/x.mp4", again.state.published)
+
+            p.write_text("{ 坏掉的 json", encoding="utf-8")
+            self.assertFalse(watch.Store(p).state.baseline_done)
+
+    def test_from_json_tolerates_wrong_types(self):
+        from vp_publish import watch
+        st = watch.WatchState.from_json({"seen": {"a": "不是字典"},
+                                         "published": ["不是字典"]})
+        self.assertEqual(st.seen, {})
+        self.assertEqual(st.published, {})
+
+    def test_cli_reference_is_valid(self):
+        """cli.py 里写的是 watch.Store —— 守住这个名字，别再对不上。"""
+        from vp_publish import cli, watch
+        self.assertTrue(callable(watch.Store))
+        self.assertIs(watch.WatchStore, watch.Store)
+        self.assertIn("watch.Store(", inspect.getsource(cli))
+
+    def test_watch_has_no_force_flag(self):
+        """watch 不该有 --force。
+
+        守护进程里 --force 意味着「每轮都重发一遍」，是个纯粹的脚枪。
+        要重发某一条，用 `vp-publish forget <视频>`。
+        """
+        from vp_publish import cli
+        with self.assertRaises(SystemExit):
+            cli.build_sub_parser().parse_args(["watch", "--force"])
+        src = inspect.getsource(cli.cmd_watch)
+        self.assertNotIn("args.force", src)
+
+    def test_watch_dry_run_prints_argv(self):
+        """试运行必须能看见要执行什么，否则等于没试。"""
+        from vp_publish import cli
+        src = inspect.getsource(cli.cmd_watch)
+        self.assertIn("res['argv']", src)
+
+
+class TestWatchDescribe(unittest.TestCase):
+    def test_round_line_mentions_only_nonzero(self):
+        from vp_publish import watch
+        line = watch.describe_round(3, 5, ready=1, published=1, failed=0, skipped=0)
+        self.assertIn("第 3 轮", line)
+        self.assertIn("扫描 5", line)
+        self.assertIn("已发 1", line)
+        self.assertNotIn("失败", line)
 
 
 if __name__ == "__main__":

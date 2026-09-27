@@ -270,4 +270,8 @@ cat <<EOF
 
   4) 发
        ./vp-publish 你的视频.mp4
+
+  5) 或者让它自己盯着目录发（推荐，接上流水线）
+       ./vp-publish watch ~/vp/videos --once --dry-run   # 先看看会发什么
+       ./vp-publish watch ~/vp/videos                    # 常驻
 EOF
