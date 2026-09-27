@@ -20,9 +20,10 @@ jobs:
         python-version: ["3.10", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      # 用最新 major —— v4/v5 跑在 Node 20 上，已经被 GitHub 标弃用了
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
