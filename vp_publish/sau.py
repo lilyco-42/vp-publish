@@ -91,6 +91,24 @@ def account_file(cfg: Config, plat_key: str, account: str) -> Path:
     return cfg.sau.cookies_dir / f"{plat_key}_{account}.json"
 
 
+def resolve_account(cfg: Config, plat_key: str, *,
+                    override: str = "",
+                    available: dict[str, list[str]] | None = None) -> str:
+    """决定这次用哪个账号名。
+
+    优先级：命令行指定 > 配置里配的 > 已经登录过的那个 > 「我的{平台名}」。
+    抽出来是因为命令行登录和网页登录必须用**同一套规则** ——
+    否则网页里登录写进 A 文件，命令行去读 B 文件，两边永远对不上。
+    """
+    avail = available if available is not None else discover_accounts(cfg)
+    plat = platforms.BY_KEY.get(plat_key)
+    label = plat.label if plat else plat_key
+    return (override
+            or cfg.sau.accounts.get(plat_key, "")
+            or (avail.get(plat_key) or [""])[0]
+            or f"我的{label}")
+
+
 # ── 结果 ────────────────────────────────────────────────────────
 @dataclass
 class RunResult:
@@ -179,6 +197,10 @@ def _env(cfg: Config) -> dict[str, str]:
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("PYTHONIOENCODING", "utf-8")
     return env
+
+
+# 公开别名：login-web 要用同一套环境起子进程，不能各写一份
+env_for_subprocess = _env
 
 
 def run_stream(argv: list[str], cfg: Config, *, cwd: Path | None = None,

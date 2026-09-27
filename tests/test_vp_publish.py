@@ -828,5 +828,126 @@ class TestWatchNoPlatform(unittest.TestCase):
                       "缺少「什么都没发就不记状态」的兜底")
 
 
+# ── 网页扫码登录 ─────────────────────────────────────────────────
+class TestLoginWeb(unittest.TestCase):
+    """login-web 里最容易写错的两件事：日志清理、以及「认哪张二维码」。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "cookies").mkdir()
+        self.cfg = Config(sau=SauConfig(root=self.root))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_strip_noise_drops_qr_blocks_keeps_real_lines(self):
+        """日志区不能被终端二维码刷满 —— 否则真错误反而看不见。"""
+        from vp_publish import loginweb
+        raw = ("\x1b[32mINFO\x1b[0m: 二维码已经准备好啦\n"
+               "████████████████████████████████████\n"
+               "▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀\n"
+               "ERROR: 登录失败：网络超时\n")
+        out = loginweb._strip_noise(raw)
+        self.assertIn("二维码已经准备好啦", out)
+        self.assertIn("ERROR: 登录失败：网络超时", out)
+        self.assertNotIn("█", out)
+        self.assertNotIn("\x1b", out, "ANSI 转义也要清掉")
+
+    def test_qr_lookup_is_platform_strict(self):
+        """只认当前平台自己的二维码文件名。
+
+        这是实测踩过的坑：sau.newest_qr() 会兜底 glob 整个 cookies 目录的
+        *.png，在网页里就会让你扫到**上一个平台的二维码** ——
+        页面看起来完全正常，扫了就是登不上。
+        """
+        from vp_publish import loginweb
+        t0 = time.time()
+        mine = self.root / "cookies" / "douyin_我的抖音_login_qrcode_20260101_000001.png"
+        mine.write_bytes(b"mine")
+        # 另一个平台的码更新 —— 绝不能被抓过来
+        other = self.root / "cookies" / "bilibili_我的B站_login_qrcode_20260101_000002.png"
+        other.write_bytes(b"other")
+        os.utime(mine, (t0, t0))
+        os.utime(other, (t0 + 5, t0 + 5))
+
+        hub = loginweb.Hub(self.cfg)
+        got = hub._qr_for("douyin", "我的抖音", t0 - 1)
+        self.assertEqual(got, mine, "抓到了别的平台的二维码")
+
+    def test_qr_lookup_ignores_stale_files(self):
+        from vp_publish import loginweb
+        old = self.root / "cookies" / "douyin_a_login_qrcode_20200101_000000.png"
+        old.write_bytes(b"old")
+        t_old = time.time() - 86400
+        os.utime(old, (t_old, t_old))
+        hub = loginweb.Hub(self.cfg)
+        self.assertIsNone(hub._qr_for("douyin", "a", time.time() - 10),
+                          "上一次登录留下的旧二维码不该被复用")
+
+    def test_page_makes_no_external_requests(self):
+        """页面必须零外部请求 —— 板子可能根本连不上外网。
+
+        这也是不复用 lilyco-gui 的原因：它从公网 CDN 拉 layui，
+        拉不到就整页失灵，而且事件绑定全在 CDN 回调里 → 按钮点了没反应还不报错。
+        """
+        from vp_publish import loginweb
+        page = loginweb.PAGE
+        for bad in ("http://", "https://", "//cdn", "cdn."):
+            self.assertNotIn(bad, page, f"页面里有外部引用：{bad}")
+        self.assertIn("<img", page)
+        self.assertNotIn("layui", page.lower())
+
+    def test_idle_state_shape(self):
+        from vp_publish import loginweb
+        st = loginweb.Hub(self.cfg).state()
+        self.assertEqual(st["status"], "idle")
+        self.assertFalse(st["platform"])
+        self.assertEqual(len(st["platforms"]), len(platforms.PLATFORMS))
+        self.assertIn("refresh_after", st)
+
+    def test_start_rejects_unknown_platform(self):
+        from vp_publish import loginweb
+        hub = loginweb.Hub(self.cfg)
+        out = hub.start("不存在的平台")
+        self.assertFalse(out["ok"])
+        self.assertIn("认不出", out["error"])
+
+    def test_http_token_and_routes(self):
+        """没 token 的 API 请求要被挡住；页面本身要能打开。"""
+        import http.server
+        import threading
+        import urllib.error
+        import urllib.request
+        from vp_publish import loginweb
+
+        hub = loginweb.Hub(self.cfg)
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
+                                              loginweb._make_handler(hub, "s3cret"))
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            # 页面：不需要 token
+            with urllib.request.urlopen(base + "/", timeout=5) as r:
+                self.assertEqual(r.status, 200)
+                self.assertIn("扫码登录", r.read().decode("utf-8"))
+            # API：没 token → 401
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(base + "/api/state", timeout=5)
+            self.assertEqual(cm.exception.code, 401)
+            # API：带 token → 200
+            with urllib.request.urlopen(base + "/api/state?k=s3cret", timeout=5) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            self.assertTrue(data["ok"])
+            # 二维码还没生成 → 404（不是 500）
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(base + "/api/qr.png?k=s3cret", timeout=5)
+            self.assertEqual(cm.exception.code, 404)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

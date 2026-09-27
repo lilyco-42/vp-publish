@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from . import __version__, config as config_mod, cover, doctor, meta as meta_mod
-from . import platforms, report, sau, state, watch
+from . import loginweb, platforms, report, sau, state, watch
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".flv", ".webm", ".m4v", ".ts", ".wmv"}
 
@@ -105,6 +105,18 @@ def build_sub_parser() -> argparse.ArgumentParser:
     l.add_argument("--headed", action="store_true", help="显示浏览器窗口（推荐）")
     l.add_argument("--qr-out", default="", help="把二维码另存到这个路径")
 
+    lw = sub.add_parser("login-web",
+                        help="开一个本地网页扫码登录（二维码在浏览器里，过期一键换）")
+    lw.add_argument("platform", nargs="?", default="", help="先打开哪个平台（可选）")
+    lw.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
+    lw.add_argument("--port", type=int, default=8765, help="端口（默认 8765）")
+    lw.add_argument("--refresh", type=int, default=loginweb.DEFAULT_REFRESH,
+                    help=f"二维码多少秒后自动换一张（默认 {loginweb.DEFAULT_REFRESH}，0=不自动换）")
+    lw.add_argument("--headed", action="store_true",
+                    help="显示浏览器窗口（板子上没显示器时别加）")
+    lw.add_argument("--no-token", action="store_true",
+                    help="关掉 URL 口令（只在完全可信的网络里用）")
+
     a = sub.add_parser("accounts", help="列出已登录的账号")
     a.add_argument("--json", action="store_true")
 
@@ -139,7 +151,8 @@ def build_sub_parser() -> argparse.ArgumentParser:
     return p
 
 
-SUBCOMMANDS = ("doctor", "login", "accounts", "platforms", "init", "forget", "watch")
+SUBCOMMANDS = ("doctor", "login", "login-web", "accounts", "platforms", "init",
+               "forget", "watch")
 
 
 # ── 视频收集 ────────────────────────────────────────────────────
@@ -684,6 +697,37 @@ def cmd_watch(args, cfg: config_mod.Config) -> int:
         time.sleep(max(1, args.interval))
 
 
+def cmd_login_web(args, cfg: config_mod.Config) -> int:
+    """开一个本地网页扫码登录。
+
+    存在的理由：扫码的死穴是**延迟** —— 命令行出码、取图、递给用户、用户扫，
+    每多一次往返就多烧几秒，而二维码一分钟量级就失效，过期了命令行还不会重出。
+    网页把这条路压到最短，并且过期一键换 / 到期自动换。
+    """
+    first = ""
+    if args.platform:
+        first = platforms.resolve(args.platform) or ""
+        if not first:
+            die(f"认不出平台名：{args.platform}\n"
+                f"  可用：{', '.join(p.key for p in platforms.PLATFORMS)}")
+
+    token = "" if args.no_token else loginweb.new_token()
+
+    def ready(url: str) -> None:
+        say("扫码登录网页已经起来了，在浏览器里打开：")
+        say(f"  {url}")
+        say("")
+        say("  点平台名出二维码；二维码过期不用管，到点会自己换新的。")
+        if token:
+            say("  ⚠ 地址里的 ?k=... 是访问口令，整条复制，别只复制到问号前。")
+        say("  停止：Ctrl-C")
+
+    return loginweb.serve(
+        cfg, host=args.host, port=args.port, token=token,
+        refresh_after=args.refresh, headless=not args.headed,
+        first=first, on_ready=ready)
+
+
 def cmd_doctor(args, cfg: config_mod.Config) -> int:
     only: list[str] = []
     if args.only:
@@ -711,8 +755,8 @@ def cmd_login(args, cfg: config_mod.Config) -> int:
         die(sau.sau_problem(cfg))
 
     available = sau.discover_accounts(cfg)
-    account = args.account or cfg.sau.accounts.get(key) or \
-        (available.get(key) or [""])[0] or f"我的{plat.label}"
+    account = sau.resolve_account(cfg, key, override=args.account,
+                                  available=available)
 
     acct_file = sau.account_file(cfg, key, account)
     before = acct_file.stat().st_mtime if acct_file.is_file() else 0.0
@@ -883,6 +927,7 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {
         "doctor": cmd_doctor,
         "login": cmd_login,
+        "login-web": cmd_login_web,
         "accounts": cmd_accounts,
         "platforms": cmd_platforms,
         "init": cmd_init,

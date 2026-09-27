@@ -261,6 +261,9 @@ cat <<EOF
        cd ~/vp-publish && ./vp-publish doctor
 
   2) 登录你要发的平台（每个平台一次，要人扫码）
+       推荐用网页，二维码直接显示在浏览器里，过期一键换：
+       ./vp-publish login-web
+     （不想开网页就还是命令行：）
        ./vp-publish login douyin --headed
        ./vp-publish login xiaohongshu --headed
        ./vp-publish login bilibili --headed

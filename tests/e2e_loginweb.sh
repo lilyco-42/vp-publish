@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# login-web 端到端演练（假 sau + 真 HTTP 服务 + 真二维码 PNG）。
+#
+# 为什么需要它：单测只到「函数返回了什么」，而 login-web 的坑全在
+# **一个真跑起来的进程**和**真的 HTTP 请求**之间：
+#   · 页面是不是真的零外部请求（引了 CDN 就等于把功能绑在公网上）
+#   · 状态机 idle → starting → waiting 是不是真的能走过去
+#   · 二维码是不是真的能从浏览器取到（不是只有一个路径字符串）
+#   · 最关键：**会不会把别的平台的二维码递给你**
+#     （sau.newest_qr() 有兜底 glob，网页里用它会让人扫到上一个平台的码，
+#       页面看起来完全正常，扫了就是登不上）
+#
+# 跑法：bash tests/e2e_loginweb.sh
+set -u
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+BASE="$(mktemp -d /tmp/vpp-web.XXXXXX)"
+PY="${PY:-python3}"
+PORT=$(( 18000 + ($$ % 900) ))
+FAILED=0
+
+note() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; FAILED=1; }
+dump() { printf '%s' "$1" | head -c 400 | sed 's/^/    /'; echo; }
+
+SERVER_PID=""
+cleanup() {
+  # 服务是后台作业，直接 kill 它；但它拉起的假 sau 得另外收
+  # （Python 被 SIGTERM 打死时不会走 finally，子进程会变孤儿）。
+  [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+  sleep 0.3
+  [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null
+  pkill -f "$BASE/sau/sau" 2>/dev/null
+  rm -rf "$BASE"
+}
+trap cleanup EXIT
+
+# ── 搭一个假的 sau 环境 ─────────────────────────────────────────
+mkdir -p "$BASE/sau/cookies"
+export FAKE_CALL_LOG="$BASE/calls.log"
+: > "$FAKE_CALL_LOG"
+
+# 假 sau：收到 login 就**自己生成一张二维码 PNG**，路径和命名完全照抄
+# sau 的真实规则（cookies/{platform}_{account}_login_qrcode_{时间戳}.png）。
+# 这样被验证的就是我们自己的查找逻辑，而不是我编的路径。
+cat > "$BASE/sau/sau" <<'STUB'
+#!/bin/sh
+echo "$*" >> "$FAKE_CALL_LOG"
+plat="$1"; shift
+case "$1" in
+  login)
+    acct="我的抖音"
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--account" ] && { acct="$2"; shift; }
+      shift
+    done
+    # 用标记文件而不是环境变量控制「这次不出码」：服务进程的环境在
+    # 它启动那一刻就固定了，之后再 export 是传不进去的。
+    if [ ! -f "$FAKE_COOKIES/.noqr" ]; then
+      ts="$(date +%Y%m%d_%H%M%S)"
+      "$FAKE_PY" "$FAKE_PNG" "$plat" "$acct" \
+        "$FAKE_COOKIES/${plat}_${acct}_login_qrcode_${ts}.png"
+    fi
+    # 真 sau 会把二维码用方块字符打到终端。我们的日志里必须把它清掉，
+    # 否则日志区被几千个方块刷满，真出错了反而看不见。
+    printf '\033[36m🖼️ 二维码已经准备好啦，已保存到: %s\033[0m\n' "$FAKE_COOKIES/x.png"
+    printf '████████████████████████████████\n'
+    printf '████████████████████████████████\n'
+    printf '🧍 请扫码，小人正在耐心等待登录完成\n'
+    sleep 20
+    ;;
+esac
+exit 0
+STUB
+chmod +x "$BASE/sau/sau"
+
+# 造一张**合法**的 PNG，并把「谁/哪个账号」写进 tEXt 块 ——
+# 这样后面可以直接 grep 二进制，确认拿到的是哪张码。
+cat > "$BASE/mkpng.py" <<'PYEOF'
+import struct, sys, zlib
+plat, acct, out = sys.argv[1], sys.argv[2], sys.argv[3]
+def chunk(tag, data):
+    body = tag + data
+    return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+w = h = 8
+raw = b"".join(b"\x00" + b"\x00\x00\x00" * w for _ in range(h))
+png = (b"\x89PNG\r\n\x1a\n"
+       + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+       + chunk(b"tEXt", b"Mark\x00" + f"{plat}/{acct}".encode())
+       + chunk(b"IDAT", zlib.compress(raw))
+       + chunk(b"IEND", b""))
+open(out, "wb").write(png)
+PYEOF
+
+export FAKE_PY="$PY" FAKE_PNG="$BASE/mkpng.py" FAKE_COOKIES="$BASE/sau/cookies"
+
+# 已登录的平台（用来验证页面上的「已登录」徽章）
+echo '[]' > "$BASE/sau/cookies/bilibili_我的B站.json"
+
+cat > "$BASE/config.json" <<EOF
+{
+  "sau": { "root": "$BASE/sau", "bin": "$BASE/sau/sau" },
+  "cover": false,
+  "watch_dirs": ["$BASE/videos"]
+}
+EOF
+export VPP_CONFIG="$BASE/config.json"
+export XDG_STATE_HOME="$BASE/state"
+
+W() { ( cd "$REPO" && "$PY" ./vp-publish "$@" ); }
+
+# 起服务。**不用子 shell**：`( ... ) &` 的 $! 是子 shell 的 pid，
+# kill 它杀不掉里面的 python，端口会一直被占着。
+# 直接跑脚本路径即可 —— Python 会把脚本所在目录加进 sys.path，与 cwd 无关。
+start_server() {                       # start_server <日志文件> <额外参数...>
+  local log="$1"; shift
+  "$PY" "$REPO/vp-publish" login-web --host 127.0.0.1 --port "$PORT" "$@" \
+    > "$log" 2>&1 &
+  SERVER_PID=$!
+  for _ in $(seq 1 60); do
+    if curl -fsS -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; then return 0; fi
+    sleep 0.25
+  done
+  return 1
+}
+
+# ── 起服务 ─────────────────────────────────────────────────────
+note "0. 起 login-web（后台，端口 $PORT）"
+start_server "$BASE/server.log" --no-token \
+  || { bad "服务没起来"; dump "$(cat "$BASE/server.log")"; exit 1; }
+ok "服务起来了（pid $SERVER_PID）"
+
+U="http://127.0.0.1:$PORT"
+
+# ── 1. 页面 ─────────────────────────────────────────────────────
+note "1. 页面本身：能打开，且**零外部请求**"
+HTML="$(curl -fsS "$U/")"
+if echo "$HTML" | grep -q "扫码登录"; then ok "页面有标题"; else bad "页面不对劲"; fi
+
+# 这条是硬要求：板子可能连不上外网，引了 CDN 就等于整页失灵。
+EXT=""
+for pat in 'http://' 'https://' '//cdn' 'cdn\.' 'layui' 'unpkg' 'jsdelivr' 'googleapis'; do
+  if echo "$HTML" | grep -qE "$pat"; then EXT="$EXT $pat"; fi
+done
+if [ -z "$EXT" ]; then ok "没有任何外部请求（CDN/字体/框架都没引）"
+else bad "页面里有外部引用：$EXT"; fi
+
+if echo "$HTML" | grep -q 'id="qr"'; then ok "有二维码容器"; else bad "找不到二维码容器"; fi
+
+# ── 2. 初始状态 ─────────────────────────────────────────────────
+note "2. 初始状态是 idle，且认得所有平台"
+ST="$(curl -fsS "$U/api/state")"
+echo "$ST" | grep -q '"status": *"idle"' && ok "status=idle" || { bad "初始不是 idle"; dump "$ST"; }
+echo "$ST" | grep -q '"douyin"' && ok "平台列表里有抖音" || bad "平台列表缺抖音"
+echo "$ST" | grep -q '"refresh_after"' && ok "带上了自动换码间隔" || bad "缺 refresh_after"
+echo "$ST" | grep -q '"我的B站"' && ok "认得出已登录的账号（页面要显示徽章）" || bad "没发现已登录账号"
+
+# ── 3. 选平台 → 出码 ────────────────────────────────────────────
+note "3. 点抖音 → 起 sau → 出二维码"
+CODE="$(curl -sS -o "$BASE/start.json" -w '%{http_code}' -X POST --data 'douyin' "$U/api/start")"
+if [ "$CODE" = 200 ]; then ok "POST /api/start 返回 200"; else bad "start 返回 $CODE"; fi
+dump "$(cat "$BASE/start.json")"
+grep -q '"ok": *true' "$BASE/start.json" && ok "接受了这个平台" || bad "没接受"
+grep -q 'douyin login' "$FAKE_CALL_LOG" && ok "真的把 sau 拉起来了" \
+  || bad "没调 sau：$(cat "$FAKE_CALL_LOG")"
+
+# 等到出码
+GOT=0
+for _ in $(seq 1 60); do
+  ST="$(curl -fsS "$U/api/state")"
+  echo "$ST" | grep -q '"status": *"waiting"' && { GOT=1; break; }
+  sleep 0.25
+done
+if [ "$GOT" = 1 ]; then ok "状态走到了 waiting"; else bad "一直没出码"; dump "$ST"; fi
+echo "$ST" | grep -q '"qr_mtime": *[1-9]' && ok "带上了二维码时间戳" || bad "qr_mtime 是空的"
+
+# ── 4. 二维码真的取得到 ─────────────────────────────────────────
+note "4. 浏览器拿得到二维码（不是只有一个路径字符串）"
+curl -fsS "$U/api/qr.png" -o "$BASE/got.png"
+MAGIC="$(head -c 4 "$BASE/got.png" | od -An -tx1 | tr -d ' \n')"
+if [ "$MAGIC" = "89504e47" ]; then ok "是合法 PNG"
+else bad "拿到的不是 PNG（magic=$MAGIC）"; fi
+if grep -aq 'douyin/' "$BASE/got.png"; then ok "确实是抖音的码"
+else bad "拿到的码不是抖音的"; fi
+
+# ── 5. 只认本平台的码（最要紧的一条）────────────────────────────
+note "5. 别的平台的码更新，也不能递给我"
+# 造一张**更新**的 B 站二维码。sau.newest_qr() 的兜底 glob 会捞到它，
+# 页面看起来正常，用户扫了却登不上 —— 这就是要防的事。
+"$PY" "$BASE/mkpng.py" bilibili 我的B站 \
+  "$BASE/sau/cookies/bilibili_我的B站_login_qrcode_20991231_235959.png"
+sleep 1.1
+curl -fsS "$U/api/qr.png" -o "$BASE/got2.png"
+if grep -aq 'douyin/' "$BASE/got2.png"; then ok "仍然给的是抖音的码（没被更新的 B 站码顶掉）"
+else bad "把别的平台的码递出来了！"; fi
+
+# 反过来：只放 B 站的码、登抖音，就该是「还没出码」，而不是拿 B 站的凑数
+rm -f "$BASE/sau/cookies/douyin_我的抖音_login_qrcode_"*.png
+: > "$BASE/sau/cookies/.noqr"          # 让假 sau 这次不出码
+curl -fsS -X POST --data 'douyin' "$U/api/start" >/dev/null
+sleep 0.6
+ST="$(curl -fsS "$U/api/state")"
+if echo "$ST" | grep -q '"qr_mtime": *0'; then ok "本平台没码时就说没码，不拿别人的凑"
+else bad "没码却报有码：$(echo "$ST" | head -c 200)"; fi
+rm -f "$BASE/sau/cookies/.noqr"
+
+# ── 6. 日志里的方块要被清掉 ─────────────────────────────────────
+note "6. 日志区不该被终端二维码刷满"
+curl -fsS -X POST --data 'douyin' "$U/api/start" >/dev/null
+sleep 0.8
+ST="$(curl -fsS "$U/api/state")"
+if echo "$ST" | grep -q '二维码已经准备好啦'; then ok "看得到真日志"; else bad "日志没读到"; fi
+if echo "$ST" | grep -q '█'; then bad "方块字符漏进日志了"; else ok "方块字符被清掉了"; fi
+
+# ── 7. 停止 ─────────────────────────────────────────────────────
+note "7. 停止后回到 idle，且不留后台进程"
+curl -fsS -X POST "$U/api/stop" >/dev/null
+sleep 0.4
+ST="$(curl -fsS "$U/api/state")"
+echo "$ST" | grep -q '"status": *"idle"' && ok "回到 idle" || { bad "没回到 idle"; dump "$ST"; }
+
+# ── 8. 认不出的平台要说人话 ─────────────────────────────────────
+note "8. 传个不存在的平台，得给出能看懂的理由"
+curl -sS -o "$BASE/bad.json" -X POST --data 'meituan' "$U/api/start"
+if grep -q '认不出' "$BASE/bad.json"; then ok "说的是「认不出平台」"
+else bad "报错驴唇不对马嘴"; dump "$(cat "$BASE/bad.json")"; fi
+
+# ── 9. token ────────────────────────────────────────────────────
+note "9. 带 token 时，没令牌的请求要被挡掉"
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
+start_server "$BASE/server2.log" || { bad "第二个服务没起来"; dump "$(cat "$BASE/server2.log")"; }
+# 从启动日志里把带 token 的地址捞出来
+TOK="$(grep -o 'k=[A-Za-z0-9_-]*' "$BASE/server2.log" | head -1 | cut -d= -f2)"
+if [ -n "$TOK" ]; then ok "启动时打印了带 token 的地址"; else bad "没打印 token 地址"; dump "$(cat "$BASE/server2.log")"; fi
+
+C1="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/state")"
+[ "$C1" = 401 ] && ok "没 token → 401" || bad "没 token 却给了 $C1"
+C2="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/state?k=$TOK")"
+[ "$C2" = 200 ] && ok "带 token → 200" || bad "带 token 却是 $C2"
+C3="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")"
+[ "$C3" = 200 ] && ok "首页免 token（否则没法把链接发给自己）" || bad "首页被挡了：$C3"
+
+# ── 收尾 ────────────────────────────────────────────────────────
+printf '\n'
+if [ "$FAILED" = 0 ]; then
+  printf '\033[1;32mlogin-web 演练全部通过\033[0m\n'
+else
+  printf '\033[1;31mlogin-web 演练有失败\033[0m\n'
+fi
+exit "$FAILED"
