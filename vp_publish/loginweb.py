@@ -117,10 +117,15 @@ class Hub:
         self.log_dir = Path(cache) / "vp-publish" / "login"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.sau_path = sau.find_sau(cfg)
-        self.problem = "" if self.sau_path else sau.sau_problem(cfg)
+        self.sau_python = sau.find_sau_python(cfg)
+        # 后端「能用」的判据放宽到「有 CLI **或** 有解释器」——
+        # TikTok 这类平台只走自带驱动，根本不需要 sau 那个可执行文件，
+        # 但需要它旁边的 python。只认 CLI 的话，这种机器会被误报成「没装 sau」。
+        self.problem = "" if (self.sau_path or self.sau_python) else sau.sau_problem(cfg)
 
     # ── 子进程 ──────────────────────────────────────────────
-    def _spawn(self, key: str, account: str, *, keep_qr: bool = False) -> None:
+    def _spawn(self, argv: list[str], key: str, account: str, *,
+               keep_qr: bool = False) -> None:
         """拉起一次登录。`keep_qr=True` 时保留上一张码继续显示。
 
         为什么需要 keep_qr：chromium 起来要十几秒，这段时间里页面如果
@@ -130,9 +135,10 @@ class Hub:
         但**换平台时必须清掉**（keep_qr=False）—— 否则会出现
         「页面显示抖音的码，实际在登 B 站」这种事，扫了就是登不上，
         而且零报错。这正是本模块开头警告的那个坑。
+
+        `argv` 由 `sau.login_command()` 给 —— 那里按平台决定是调 sau CLI
+        还是跑 vp-publish 自带的驱动脚本（TikTok 就是后者）。这里不关心。
         """
-        argv = sau.build_login_argv(self.sau_path, key, account,
-                                    headless=self.headless)
         log_path = self.log_dir / f"{key}.log"
         fh = open(log_path, "wb")
         kwargs: dict = dict(
@@ -215,15 +221,19 @@ class Hub:
                     f"    cd ~/vp-publish && ./vp-publish login {key} "
                     f"--account {acct}\n"
                     f"  二维码会打印在终端里，也会存成图片。")}
-            if self.sau_path is None:
+            if self.sau_path is None and self.sau_python is None:
                 return {"ok": False, "error": self.problem}
             # 同一个平台重开 = 换一张码 → 旧码继续挂着，别让页面空十几秒。
             # 换了平台就绝不能留，不然会显示着 A 平台的码去登 B 平台。
             same = bool(self.session.active and self.session.platform == key)
+            acct = sau.resolve_account(self.cfg, key, override=account)
+            argv, problem = sau.login_command(self.cfg, key, acct,
+                                              headless=self.headless)
+            if argv is None:
+                return {"ok": False, "error": problem}
             self._kill(self.session.proc)
             self._close_log()
-            acct = sau.resolve_account(self.cfg, key, override=account)
-            self._spawn(key, acct, keep_qr=same)
+            self._spawn(argv, key, acct, keep_qr=same)
             return {"ok": True, "platform": key, "account": acct,
                     "reused": same}
 

@@ -32,6 +32,7 @@ cleanup() {
   sleep 0.3
   [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null
   pkill -f "$BASE/sau/sau" 2>/dev/null
+  pkill -f "$BASE/sau/python" 2>/dev/null
   rm -rf "$BASE"
 }
 trap cleanup EXIT
@@ -82,6 +83,30 @@ exit 0
 STUB
 chmod +x "$BASE/sau/sau"
 
+# 假「sau 的 python」：TikTok 这类平台**不经过 sau CLI**，而是由 vp-publish
+# 自带的驱动脚本干，驱动脚本又必须用 sau venv 里的解释器跑（playwright 在里头）。
+# 这里造一个假解释器，把「网页点一下 → 真的把驱动脚本拉起来 → 真的出码」
+# 这条链演练到。不这么做的话，这段分发逻辑只能靠读源码「确认」。
+cat > "$BASE/sau/python" <<'STUB'
+#!/bin/sh
+echo "PYTHON $*" >> "$FAKE_CALL_LOG"
+driver="$1"; shift
+[ "$1" = "login" ] || exit 0
+qr_dir=""; prefix=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --qr-dir)    qr_dir="$2"; shift;;
+    --qr-prefix) prefix="$2"; shift;;
+  esac
+  shift
+done
+"$FAKE_PY" "$FAKE_PNG" tiktok "${prefix#tiktok_}" \
+  "$qr_dir/${prefix}_tk_login_qrcode_$(date +%Y%m%d_%H%M%S).png"
+printf '[二维码] %s\n' "$qr_dir/${prefix}_tk_login_qrcode_x.png"
+sleep 20
+STUB
+chmod +x "$BASE/sau/python"
+
 # 造一张**合法**的 PNG，并把「谁/哪个账号」写进 tEXt 块 ——
 # 这样后面可以直接 grep 二进制，确认拿到的是哪张码。
 cat > "$BASE/mkpng.py" <<'PYEOF'
@@ -107,7 +132,11 @@ echo '[]' > "$BASE/sau/cookies/bilibili_我的B站.json"
 
 cat > "$BASE/config.json" <<EOF
 {
-  "sau": { "root": "$BASE/sau", "bin": "$BASE/sau/sau" },
+  "sau": {
+    "root": "$BASE/sau",
+    "bin": "$BASE/sau/sau",
+    "python": "$BASE/sau/python"
+  },
   "cover": false,
   "watch_dirs": ["$BASE/videos"]
 }
@@ -264,6 +293,34 @@ for spec in "xiaohongshu:我的小红书:xhs_login_qrcode" \
     bad "$PLAT 的码认不出来 —— 页面会显示「没有二维码」"
   fi
 done
+
+# ── 5e. TikTok：sau CLI 里没有它，得走 vp-publish 自带的驱动 ────
+note "5e. TikTok 不走 sau CLI，要走自带驱动（用 sau 的 python 跑 tk_driver.py）"
+# 为什么单独验这个：TikTok 是唯一一个 `driver != "cli"` 的平台。
+# 它走的是完全另一条进程链（sau 的 python + 包内的驱动脚本），
+# 任何一环接错都表现为「点了没反应」或「页面一直转圈」——
+# 而这正是本模块开头警告的那类坑。单测只验 argv 形状，验不到这里。
+curl -sS -X POST --data 'tiktok' "$U/api/start" -o "$BASE/tk.json"
+FOUND=0
+for _ in $(seq 1 40); do
+  sleep 0.25
+  ST="$(curl -fsS "$U/api/state")"
+  echo "$ST" | grep -q '"qr_mtime": *[1-9]' && { FOUND=1; break; }
+done
+if [ "$FOUND" = 1 ]; then ok "TikTok 的码出来了"
+else bad "TikTok 起不来"; dump "$(cat "$BASE/tk.json")"; fi
+
+if grep -q 'tk_driver.py login' "$FAKE_CALL_LOG"; then
+  ok "真的把驱动脚本拉起来了（不是去调 sau tiktok）"
+else bad "没拉起驱动脚本"; dump "$(tail -3 "$FAKE_CALL_LOG")"; fi
+if grep -q -- '--qr-prefix tiktok_' "$FAKE_CALL_LOG"; then
+  ok "二维码前缀带平台名（前缀不对就会捞到别的平台的码）"
+else bad "前缀里没有平台名"; dump "$(tail -3 "$FAKE_CALL_LOG")"; fi
+
+if [ "$(curl -sS -o "$BASE/tk.png" -w '%{http_code}' "$U/api/qr.png")" = 200 ] \
+   && grep -aq 'tiktok/' "$BASE/tk.png"; then
+  ok "网页上拿到的确实是 TikTok 自己的码"
+else bad "拿到的不是 TikTok 的码"; fi
 
 # ── 6. 日志里的方块要被清掉 ─────────────────────────────────────
 note "6. 日志区不该被终端二维码刷满"

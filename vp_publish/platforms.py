@@ -33,16 +33,29 @@ NOTE = "note"                      # 支持图文（本次只发视频，占位�
 #     这是「必须是 Google 出的真 Chrome」，chromium 顶不上。
 BILIUP = "biliup"
 CHROME = "chrome"
+#   · TikTok：sau 的 CLI 里**根本没有 tiktok 这个子命令**（实测
+#     `sau tiktok` → `invalid choice: 'tiktok'`），但仓库里躺着
+#     `uploader/tk_uploader/main_chrome.py`，是完整可用的实现。
+#     也就是说上游写好了、没接进命令行。vp-publish 自带驱动脚本代跑它，
+#     而驱动脚本必须用 **sau 那个 venv 的解释器**（playwright 在里头）。
+SAU_PY = "sau_python"
+
+# driver 字段的取值。DRIVER_CLI = 调 sau 命令行；其余值 = vp-publish 自带驱动，
+# 驱动脚本的路径按约定推出来：vp_publish/<值>_driver.py（见 sau.driver_script）。
+DRIVER_CLI = "cli"
+DRIVER_TIKTOK = "tk"
 
 REQUIREMENT_LABEL: dict[str, str] = {
     BILIUP: "biliup（sau 会从 GitHub 自动下载它的二进制，所以需要能连上 GitHub）",
     CHROME: "真 Chrome（sau 的 YouTube 上传写死了 channel=\"chrome\"，chromium 顶不上）",
+    SAU_PY: "sau 的 venv 解释器（TikTok 的驱动脚本要用它跑，playwright 装在里头）",
 }
 
 # 表格里那一列用短标签，长解释放到底部警告里
 REQUIREMENT_SHORT: dict[str, str] = {
     BILIUP: "缺 biliup",
     CHROME: "缺真 Chrome",
+    SAU_PY: "缺 sau 的解释器",
 }
 
 # 下面这些能力是**照着 sau_cli.py 的 argparse 逐个核出来的**，不是照抄文档——
@@ -72,8 +85,17 @@ class Platform:
     login: str = "qr"
     accepts_headless: bool = True  # login 子命令认不认 --headless / --headed
     needs_proxy: bool = False      # 是否需要走代理才能连上
-    # 光有 sau 还不够，这个平台额外需要什么（见上面 BILIUP / CHROME）
+    # 光有 sau 还不够，这个平台额外需要什么（见上面 BILIUP / CHROME / SAU_PY）
     requires: tuple[str, ...] = ()
+    # 谁来干这个平台的活：
+    #   "cli" = 调 sau 的命令行（默认，10 个平台都是这样）
+    #   "tk"  = sau CLI 里没有它，改用 vp-publish 自带的驱动脚本
+    #           （vp_publish/tk_driver.py，用 sau 的 python 跑）
+    # 加这个字段是因为「上游有实现但没接进 CLI」这件事**不能靠猜**：
+    # 实测 `sau tiktok` 会被 argparse 打回 invalid choice，但
+    # uploader/tk_uploader/ 里代码是齐的。与其把用户堵在门外，
+    # 不如把上游已有的能力接出来。
+    driver: str = DRIVER_CLI
     note: str = ""                 # 给人看的补充说明
 
 
@@ -143,6 +165,17 @@ PLATFORMS: tuple[Platform, ...] = (
         requires=(CHROME,),        # sau 写死了 channel="chrome"
         note="标题上限 100 字；走 Google 账号登录（非扫码）；必须挂代理",
     ),
+    Platform(
+        key="tiktok", label="TikTok",
+        caps=frozenset({COVER}),   # 只支持单张封面；定时**故意不声明**，见下
+        login="qr",                # 扫码登录，而且是唯一一个「码画在 canvas 上」的平台
+        requires=(SAU_PY,),
+        driver=DRIVER_TIKTOK,      # sau CLI 里没有 tiktok，走自带驱动
+        note="sau 的命令行里没有 tiktok（上游只写了 uploader/tk_uploader/，"
+             "没接进 argparse），所以登录和上传都由 vp-publish 自带的驱动脚本代跑；"
+             "定时发布**未接入**——上游那套 set_schedule_time 依赖 TikTok Studio "
+             "的英文 UI 和 TUX 类名，没有端到端验证过，宁可不让它悄悄变成立即发布",
+    ),
 )
 
 BY_KEY: dict[str, Platform] = {p.key: p for p in PLATFORMS}
@@ -159,6 +192,7 @@ ALIASES: dict[str, str] = {
     "百家号": "baijiahao", "bjh": "baijiahao",
     "支付宝": "alipay", "生活号": "alipay",
     "油管": "youtube", "yt": "youtube", "youtube": "youtube",
+    "抖音国际版": "tiktok", "国际版抖音": "tiktok", "tiktok": "tiktok", "tk": "tiktok",
 }
 
 

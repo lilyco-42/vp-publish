@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -42,13 +43,17 @@ class TestPlatforms(unittest.TestCase):
                 self.assertEqual(platforms.resolve(written), expected)
 
     def test_resolve_unknown(self):
-        self.assertIsNone(platforms.resolve("tiktok"))
+        # 这两个原来拿 `tiktok` 当「不认识的平台」的例子 —— 它现在支持了
+        # （sau CLI 里没有，但 vp-publish 自带驱动接了出来），
+        # 所以换一个真的没有的平台名。别名解析见 TestTikTokPlatform.test_aliases。
+        self.assertIsNone(platforms.resolve("meituan"))
         self.assertIsNone(platforms.resolve(""))
+        self.assertEqual(platforms.resolve("tiktok"), "tiktok")
 
     def test_parse_list_reports_bad(self):
-        good, bad = platforms.parse_list("douyin, 抖音, tiktok, 不存在")
+        good, bad = platforms.parse_list("douyin, 抖音, meituan, 不存在")
         self.assertEqual(good, ["douyin"])          # 抖音 是 douyin 的别名，去重
-        self.assertEqual(bad, ["tiktok", "不存在"])
+        self.assertEqual(bad, ["meituan", "不存在"])
 
     def test_parse_list_chinese_comma(self):
         good, bad = platforms.parse_list("抖音，小红书")
@@ -660,6 +665,19 @@ class TestDoctorRequirements(unittest.TestCase):
         # 别名映射要跟 sau 一样（amd64/x64 → x86_64，arm64 → aarch64）
         self.assertEqual(doctor._biliup_platform_key(), key)
 
+    def test_tiktok_needs_the_sau_interpreter(self):
+        """TikTok 的唯一硬依赖是 **sau 的 venv 解释器**。
+
+        它不是「sau 的附属品」：TikTok 走自带驱动，压根不碰 sau 那个可执行文件，
+        但要借它 venv 里的 playwright。
+        """
+        from vp_publish import doctor
+        plat = platforms.BY_KEY["tiktok"]
+        self.assertEqual(doctor.missing_requirements(plat, self._env()),
+                         ["sau_python"])
+        env = self._env(sau_python=Path("/x/python"))
+        self.assertEqual(doctor.missing_requirements(plat, env), [])
+
     def test_render_and_dict_say_what_is_missing(self):
         from vp_publish import doctor
         with tempfile.TemporaryDirectory() as tmp:
@@ -670,14 +688,370 @@ class TestDoctorRequirements(unittest.TestCase):
             self.assertIn("缺 biliup", text)
             self.assertIn("缺真 Chrome", text)
             self.assertIn("GitHub", text)       # 底部长解释也要在
+            # 「sau 解释器」这一行要单独出现 —— 它是 TikTok 的那件事，
+            # 混在「sau 没找到」里的话，venv 在但 console script 没装的机器
+            # 会被误导去重装 sau。
+            self.assertIn("sau 解释器", text)
+            self.assertIn("缺 sau 的解释器", text)
 
             data = doctor.to_dict(cfg, env, healths)
             by = {p["key"]: p for p in data["platforms"]}
             self.assertEqual(by["bilibili"]["missing"], ["biliup"])
             self.assertEqual(by["bilibili"]["requires"], ["biliup"])
             self.assertEqual(by["youtube"]["missing"], ["chrome"])
+            self.assertEqual(by["tiktok"]["missing"], ["sau_python"])
             # 缺依赖的平台不能算「就绪」
             self.assertNotEqual(by["bilibili"]["status"], report.OK)
+            self.assertNotEqual(by["tiktok"]["status"], report.OK)
+
+
+# ── TikTok：上游有实现、但没接进 CLI ────────────────────────────
+class TestTikTokPlatform(unittest.TestCase):
+    """TikTok 是唯一一个 `driver != "cli"` 的平台。
+
+    为什么它特殊：sau 的命令行里**没有** tiktok 子命令
+    （实测 `sau tiktok` → `invalid choice: 'tiktok'`），
+    但仓库里躺着 `uploader/tk_uploader/main_chrome.py`，实现是齐的 ——
+    也就是说上游写好了、忘了接进 argparse。
+
+    这一组守的是「把它接出来之后没接歪」。
+    """
+
+    def test_tiktok_is_declared_and_uses_a_driver(self):
+        plat = platforms.BY_KEY["tiktok"]
+        self.assertEqual(plat.driver, platforms.DRIVER_TIKTOK)
+        self.assertNotEqual(plat.driver, platforms.DRIVER_CLI)
+        self.assertEqual(plat.login, "qr")     # 扫码登录，网页里能用
+        self.assertTrue(plat.accepts_headless)
+
+    def test_every_driver_platform_has_a_script(self):
+        """`driver` 值不是装饰品 —— 每个非 cli 的值都必须有对应脚本。
+
+        约定是 `vp_publish/<driver>_driver.py`。写错一个字母，
+        表现是「点了没反应」，而且要等到真跑起来才发现。
+        """
+        for plat in platforms.PLATFORMS:
+            if plat.driver == platforms.DRIVER_CLI:
+                self.assertIsNone(sau.driver_script(plat.driver))
+            else:
+                self.assertIsNotNone(
+                    sau.driver_script(plat.driver),
+                    f"{plat.key} 声明了 driver={plat.driver}，但脚本文件不存在")
+
+    def test_tiktok_needs_the_sau_interpreter(self):
+        """TikTok 要的是 **sau 的解释器**，不是那个可执行文件。
+
+        vp-publish 是零依赖的（用系统 python3 就能跑），而驱动要用
+        playwright —— playwright 只装在 sau 的 venv 里。
+        """
+        self.assertEqual(platforms.BY_KEY["tiktok"].requires,
+                         (platforms.SAU_PY,))
+
+    def test_tiktok_does_not_claim_scheduling(self):
+        """**故意**不声明定时发布。
+
+        上游的 set_schedule_time 依赖 TikTok Studio 的英文 UI 和
+        TUX 类名，没有端到端验证过。声明了的话，用户设了定时
+        却变成立即发布 —— 那是**悄悄改用户的东西**，
+        比明说「不支持」坏得多。
+        """
+        caps = platforms.BY_KEY["tiktok"].caps
+        self.assertNotIn(platforms.SCHEDULE, caps)
+        self.assertIn(platforms.COVER, caps)
+
+    def test_aliases(self):
+        for written in ("tiktok", "TikTok", "tk", "抖音国际版", "国际版抖音"):
+            self.assertEqual(platforms.resolve(written), "tiktok", written)
+
+
+class TestTikTokDriverHelpers(unittest.TestCase):
+    """驱动脚本里那几段「抽出来才测得到」的逻辑。
+
+    抽出来的理由很实在：这些逻辑原本埋在 async 函数里，
+    要「确认」它们只能去 grep 源码 —— 那不叫验证。
+    """
+
+    def test_qr_filename_is_findable_by_qr_glob(self):
+        """驱动出的码文件名必须能被 qr_glob 捞到。
+
+        这不是「再抄一遍命名规则」：这里真的拿 `sau.qr_glob()` 去盘上捞。
+        两边脱钩的症状是「扫码页永远显示没有二维码」，而码就在那儿。
+        """
+        import glob as _glob
+        from vp_publish import tk_driver
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(sau=SauConfig(root=Path(tmp)))
+            (Path(tmp) / "cookies").mkdir()
+            name = tk_driver.qr_filename("tiktok_我的TikTok", "20260927_230000")
+            (Path(tmp) / "cookies" / name).write_bytes(b"x")
+            hits = [Path(p).name for p in
+                    _glob.glob(sau.qr_glob(cfg, "tiktok", "我的TikTok"))]
+            self.assertEqual(hits, [name])
+
+    def test_qr_filename_defaults_to_now(self):
+        from vp_publish import tk_driver
+        name = tk_driver.qr_filename("tiktok_a")
+        self.assertTrue(name.startswith("tiktok_a_tk_login_qrcode_"))
+        self.assertTrue(name.endswith(".png"))
+
+    def test_caption_dedupes_desc_equal_to_title(self):
+        """没给 desc 时 vp-publish 会把 title 当 desc 传下来 —— 不能贴两遍。"""
+        from vp_publish import tk_driver
+        self.assertEqual(tk_driver.build_caption("标题", "标题"), "标题")
+        self.assertEqual(tk_driver.build_caption("标题", ""), "标题")
+        self.assertEqual(tk_driver.build_caption("标题", "   "), "标题")
+
+    def test_caption_joins_when_desc_differs(self):
+        from vp_publish import tk_driver
+        self.assertEqual(tk_driver.build_caption("标题", "简介"), "标题\n简介")
+
+    def test_patch_empty_chrome_path(self):
+        """替上游修 `LOCAL_CHROME_PATH = ""` 这个坑。
+
+        实测（同一台机器、同一个 playwright）：
+
+            chromium.launch(executable_path='')   -> 崩：spawn . ENOENT
+            chromium.launch(executable_path=None) -> OK
+
+        因为 playwright 把**空字符串**当成「要执行的程序路径」，
+        只有 None 才表示「用自带浏览器」。sau 的 conf.py 默认就是空字符串，
+        所以它的 TikTok 上传**开箱即崩**。
+        """
+        from vp_publish import tk_driver
+
+        class FakeMC:
+            LOCAL_CHROME_PATH = ""
+
+        mc = FakeMC()
+        self.assertTrue(tk_driver.patch_empty_chrome_path(mc))
+        self.assertIsNone(mc.LOCAL_CHROME_PATH)
+
+    def test_patch_leaves_a_real_chrome_path_alone(self):
+        """用户自己填了真 Chrome 路径时不许动它。"""
+        from vp_publish import tk_driver
+
+        class FakeMC:
+            LOCAL_CHROME_PATH = "/opt/google/chrome/chrome"
+
+        mc = FakeMC()
+        self.assertFalse(tk_driver.patch_empty_chrome_path(mc))
+        self.assertEqual(mc.LOCAL_CHROME_PATH, "/opt/google/chrome/chrome")
+
+    def test_driver_declares_both_actions(self):
+        """两个子命令都得在，且默认值合理。"""
+        from vp_publish import tk_driver
+        p = tk_driver.build_parser()
+
+        a = p.parse_args(["login", "--account-file", "/a.json",
+                          "--qr-dir", "/d", "--qr-prefix", "tiktok_x"])
+        self.assertEqual(a.action, "login")
+        self.assertTrue(a.headless)
+        self.assertEqual(a.wait, 300)
+        self.assertEqual(p.parse_args(["login", "--account-file", "/a.json",
+                                       "--qr-dir", "/d", "--qr-prefix", "p",
+                                       "--headed"]).headless, False)
+
+        b = p.parse_args(["upload", "--sau-root", "/s", "--account-file", "/a.json",
+                          "--file", "/v.mp4", "--title", "T", "--tags", "a,b"])
+        self.assertEqual(b.action, "upload")
+        self.assertEqual(b.tags, "a,b")
+        self.assertEqual(b.desc, "")
+
+    def test_driver_imports_are_stdlib_only(self):
+        """驱动脚本顶层**不能**依赖 vp_publish 或 playwright。
+
+        它是由 **sau 的 python** 跑的，跟 vp-publish 不是一个解释器 ——
+        顶层引了 vp_publish 就是 ImportError。playwright 也一样：
+        它只保证装在 sau 的 venv 里，顶层引了会让 `--help` 都跑不起来。
+        """
+        import ast
+        from vp_publish import tk_driver
+        tree = ast.parse(Path(tk_driver.__file__).read_text(encoding="utf-8"))
+        tops: list[str] = []
+        for node in tree.body:                       # 只看顶层
+            if isinstance(node, ast.Import):
+                tops += [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                tops.append(node.module.split(".")[0])
+        self.assertNotIn("vp_publish", tops)
+        self.assertNotIn("playwright", tops)
+        self.assertNotIn("patchright", tops)
+
+
+class TestSauPythonLookup(unittest.TestCase):
+    """找 sau 的 venv 解释器 —— TikTok 的唯一硬依赖。
+
+    三个来源：配置里写的、sau 可执行文件旁边的、venv 的常规位置。
+    最后一条**两个**都要试：POSIX 是 `bin/python`，Windows 是
+    `Scripts/python.exe`。而配置默认值写的是 POSIX 路径，
+    在 Windows 上永远不存在 —— 只试它必然失败。
+
+    注意每个用例都要**显式**给 `python`，不能靠默认值：
+    默认值是 `~/sau/.venv/bin/python`，在真的装了 sau 的机器上存在，
+    测试就变成「看运气」了（这类 bug 在板子上会红、在本机会绿）。
+    """
+
+    def test_config_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            want = Path(tmp) / "my-python"
+            want.write_text("#!/bin/sh\n")
+            cfg = Config(sau=SauConfig(root=Path(tmp), python=want))
+            self.assertEqual(sau.find_sau_python(cfg), want)
+
+    def test_sibling_of_sau_binary(self):
+        """sau 可执行文件旁边的 python —— 最可靠的一条。
+
+        能找到 sau 就一定能找到它旁边的 python（console script 和
+        解释器在同一个 bin/Scripts 目录里）。
+
+        注意 `sau` 得真的**可执行**：`find_sau()` 会查 X_OK，
+        不可执行就等于「没找到」，旁边的 python 也就跟着找不着了。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sbin = Path(tmp) / "sau"
+            sbin.write_text("#!/bin/sh\n")
+            os.chmod(sbin, 0o755)
+            py = Path(tmp) / "python"
+            py.write_text("#!/bin/sh\n")
+            cfg = Config(sau=SauConfig(root=Path(tmp), bin=sbin,
+                                       python=Path(tmp) / "nope"))
+            with unittest.mock.patch.object(sau.shutil, "which",
+                                            return_value=None):
+                self.assertEqual(sau.find_sau_python(cfg), py)
+
+    def test_windows_scripts_layout(self):
+        """Windows 的 venv 是 `Scripts/python.exe`，不是 `bin/python`。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            scripts = Path(tmp) / ".venv" / "Scripts"
+            scripts.mkdir(parents=True)
+            py = scripts / "python.exe"
+            py.write_text("")
+            cfg = Config(sau=SauConfig(root=Path(tmp),
+                                       bin=Path(tmp) / "no-such-sau",
+                                       python=Path(tmp) / "nope"))
+            with unittest.mock.patch.object(sau.shutil, "which",
+                                            return_value=None):
+                self.assertEqual(sau.find_sau_python(cfg), py)
+
+    def test_posix_bin_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = Path(tmp) / ".venv" / "bin"
+            b.mkdir(parents=True)
+            py = b / "python"
+            py.write_text("#!/bin/sh\n")
+            cfg = Config(sau=SauConfig(root=Path(tmp),
+                                       bin=Path(tmp) / "no-such-sau",
+                                       python=Path(tmp) / "nope"))
+            with unittest.mock.patch.object(sau.shutil, "which",
+                                            return_value=None):
+                self.assertEqual(sau.find_sau_python(cfg), py)
+
+    def test_none_when_nothing_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(sau=SauConfig(root=Path(tmp),
+                                       bin=Path(tmp) / "no-such-sau",
+                                       python=Path(tmp) / "nope"))
+            with unittest.mock.patch.object(sau.shutil, "which",
+                                            return_value=None):
+                self.assertIsNone(sau.find_sau_python(cfg))
+
+    def test_backend_ok_accepts_python_only(self):
+        """只有解释器、没有 console script 的机器，不该被整机拒掉 ——
+        它其实能发 TikTok。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            b = Path(tmp) / ".venv" / "bin"
+            b.mkdir(parents=True)
+            (b / "python").write_text("#!/bin/sh\n")
+            cfg = Config(sau=SauConfig(root=Path(tmp),
+                                       bin=Path(tmp) / "no-such-sau",
+                                       python=Path(tmp) / "nope"))
+            with unittest.mock.patch.object(sau.shutil, "which",
+                                            return_value=None):
+                self.assertTrue(sau.backend_ok(cfg))
+
+
+class TestDriverDispatch(unittest.TestCase):
+    """`login_command` / `upload` 的分流。
+
+    这两个函数是**所有上层路径的唯一出口**：命令行 `login`、网页 `login-web`、
+    `publish`、`watch` 全都从这里拿命令。分流写错的话，症状是
+    「网页点了没反应、命令行却能用」这种最难查的分裂。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        b = self.root / ".venv" / "bin"
+        b.mkdir(parents=True)
+        (b / "python").write_text("#!/bin/sh\n")
+        self.cfg = Config(sau=SauConfig(root=self.root,
+                                        bin=self.root / "no-such-sau",
+                                        python=self.root / "nope"))
+        self.m = meta.Meta(title="标题", desc="", tags=["AI"])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_login_command_uses_driver_for_tiktok(self):
+        with unittest.mock.patch.object(sau.shutil, "which", return_value=None):
+            argv, problem = sau.login_command(self.cfg, "tiktok", "我的TikTok")
+        self.assertEqual(problem, "")
+        self.assertIsNotNone(argv)
+        self.assertTrue(argv[1].endswith("tk_driver.py"), argv[1])
+        self.assertEqual(argv[2], "login")
+        # 账号文件必须跟 discover_accounts 的命名对齐，否则登录写进去、
+        # 体检和发布又去读另一个文件，两边永远对不上。
+        self.assertIn(str(self.root / "cookies" / "tiktok_我的TikTok.json"), argv)
+        self.assertIn("tiktok_我的TikTok", argv)
+
+    def test_login_command_uses_cli_for_normal_platforms(self):
+        sbin = self.root / "sau"
+        sbin.write_text("#!/bin/sh\n")
+        os.chmod(sbin, 0o755)          # find_sau() 查 X_OK
+        cfg = Config(sau=SauConfig(root=self.root, bin=sbin))
+        argv, problem = sau.login_command(cfg, "douyin", "我的抖音")
+        self.assertEqual(problem, "")
+        self.assertEqual(argv[:3], [str(sbin), "douyin", "login"])
+
+    def test_login_command_explains_when_backend_missing(self):
+        """缺东西时要说清缺哪一样，不能只甩一句「失败了」。"""
+        with unittest.mock.patch.object(sau.shutil, "which", return_value=None):
+            argv, problem = sau.login_command(self.cfg, "tiktok", "x")
+        self.assertIsNotNone(argv)          # 解释器在，驱动能跑
+        (self.root / ".venv" / "bin" / "python").unlink()
+        with unittest.mock.patch.object(sau.shutil, "which", return_value=None):
+            argv, problem = sau.login_command(self.cfg, "tiktok", "x")
+        self.assertIsNone(argv)
+        self.assertIn("解释器", problem)
+        self.assertIn("playwright", problem)
+
+    def test_upload_routes_tiktok_to_the_driver(self):
+        with unittest.mock.patch.object(sau.shutil, "which", return_value=None):
+            res = sau.upload(None, platforms.BY_KEY["tiktok"], "我的TikTok",
+                             Path("/v.mp4"), self.m, {}, self.cfg, dry_run=True)
+        self.assertTrue(res.ok)
+        self.assertTrue(res.argv[1].endswith("tk_driver.py"))
+        self.assertEqual(res.argv[2], "upload")
+        self.assertIn("--title", res.argv)
+        self.assertIn("标题", res.argv)
+
+    def test_upload_never_claims_success_without_a_backend(self):
+        """sau 一个都没有时，绝不能返回 ok —— 那会把视频记成「已发布」，
+        然后被永久跳过。"""
+        with unittest.mock.patch.object(sau.shutil, "which", return_value=None):
+            res = sau.upload(None, platforms.BY_KEY["douyin"], "acct",
+                             Path("/v.mp4"), self.m, {}, self.cfg)
+        self.assertFalse(res.ok)
+        self.assertIn("sau", res.reason)
+
+    def test_upload_does_not_need_sau_binary_for_driver_platforms(self):
+        """TikTok 走驱动，`sau` 那个可执行文件不存在也无所谓 ——
+        传 None 进去照样能组出命令（这才是「解耦」的证据）。"""
+        with unittest.mock.patch.object(sau.shutil, "which", return_value=None):
+            res = sau.upload(None, platforms.BY_KEY["tiktok"], "acct",
+                             Path("/v.mp4"), self.m, {}, self.cfg, dry_run=True)
+        self.assertTrue(res.ok)
+        self.assertNotIn("upload-video", res.argv)   # 那是 sau CLI 的子命令名
 
 
 # ── 配置 ────────────────────────────────────────────────────────

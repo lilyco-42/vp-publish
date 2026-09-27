@@ -69,6 +69,7 @@ class Environment:
     proxy: str = ""
     biliup: Path | None = None      # B站 的后端，sau 会从 GitHub 自动下载
     chrome: Path | None = None      # 真 Chrome（YouTube 只认它）
+    sau_python: Path | None = None  # sau venv 的解释器（TikTok 驱动要用它跑）
     warnings: list[str] = field(default_factory=list)
 
 
@@ -127,13 +128,14 @@ def find_chrome() -> Path | None:
 
 
 def missing_requirements(plat: platforms.Platform, env: Environment) -> list[str]:
-    """这个平台还缺什么。返回的是**依赖 key**（biliup / chrome），
+    """这个平台还缺什么。返回的是**依赖 key**（biliup / chrome / sau_python），
     给人看的短标签和长解释都在 platforms.REQUIREMENT_* 里 ——
     这样加新依赖只需要动 platforms.py 一处。
     """
     have = {
         platforms.BILIUP: env.biliup is not None,
         platforms.CHROME: env.chrome is not None,
+        platforms.SAU_PY: env.sau_python is not None,
     }
     return [req for req in plat.requires if not have.get(req, True)]
 
@@ -182,7 +184,8 @@ def inspect_environment(cfg: Config, *, check_proxy: bool = False) -> Environmen
     env = Environment(proxy=cfg.proxy)
 
     env.sau_path = sau.find_sau(cfg)
-    if env.sau_path is None:
+    env.sau_python = sau.find_sau_python(cfg)
+    if env.sau_path is None and env.sau_python is None:
         env.sau_problem = sau.sau_problem(cfg)
 
     env.ffmpeg, env.ffprobe = cover.tools_available()
@@ -287,6 +290,13 @@ def render(cfg: Config, env: Environment, healths: list[PlatformHealth],
         lines.append("  ✗ sau            没找到")
         for ln in env.sau_problem.splitlines():
             lines.append(f"      {ln.strip()}")
+    # 解释器单独一行：它不是「sau 的附属品」，TikTok 这类平台只认它。
+    # 只报「sau 没找到」会让「venv 在、console script 没装」的机器白挨一顿排查。
+    # 标签按**显示宽度**补齐（中文算两格），否则这一列会跟上面几行错开。
+    if env.sau_python:
+        lines.append(f"  ✓ sau 解释器     {env.sau_python}")
+    else:
+        lines.append("  · sau 解释器     没找到（TikTok 需要它）")
     lines.append(f"  {'✓' if env.ffmpeg else '·'} ffmpeg          "
                  f"{'可用（自动生成封面）' if env.ffmpeg else '不可用'}")
     if env.browsers:
@@ -354,9 +364,12 @@ def render(cfg: Config, env: Environment, healths: list[PlatformHealth],
 
 def to_dict(cfg: Config, env: Environment, healths: list[PlatformHealth]) -> dict:
     return {
-        "ok": env.sau_path is not None and any(h.status == report.OK for h in healths),
+        # 后端判据是「CLI 或解释器」，跟 sau.backend_ok() 一致
+        "ok": (env.sau_path is not None or env.sau_python is not None)
+              and any(h.status == report.OK for h in healths),
         "env": {
             "sau": str(env.sau_path) if env.sau_path else None,
+            "sau_python": str(env.sau_python) if env.sau_python else None,
             "sau_problem": env.sau_problem,
             "ffmpeg": env.ffmpeg,
             "browsers": env.browsers,

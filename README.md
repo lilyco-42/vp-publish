@@ -231,16 +231,19 @@ YouTube       我的YouTube  ✓ 就绪    约 30 天后过期
 ```
 B站           我的B站      ✗ 失效    缺 biliup；约 120 天后过期
 YouTube       我的YouTube  ✗ 失效    缺真 Chrome
+TikTok        我的TikTok   ✗ 失效    缺 sau 的解释器
 
   ⚠ biliup（sau 会从 GitHub 自动下载它的二进制，所以需要能连上 GitHub）
   ⚠ 真 Chrome（sau 的 YouTube 上传写死了 channel="chrome"，chromium 顶不上）
+  ⚠ sau 的 venv 解释器（TikTok 的驱动脚本要用它跑，playwright 装在里头）
 ```
 
-这两个依赖是**照着源码核出来的**，不是照文档抄的：
+这三个依赖是**照着源码核出来的**，不是照文档抄的：
 B站 的 biliup 由 `uploader/bilibili_uploader/runtime.py` 从 GitHub Releases
 自动下载到 `~/.social-auto-upload/tools/biliup/<系统>-<架构>/`；
 YouTube 的 `uploader/youtube_uploader/main.py` 里三处 `launch()` 全写着
-`channel="chrome"`。JSON 输出里也有（`requires` / `missing` 两个字段）。
+`channel="chrome"`；TikTok 的驱动必须用 sau venv 里的 playwright 跑。
+JSON 输出里也有（`requires` / `missing` 两个字段）。
 
 ### 扫码登录网页（`login-web`）—— 推荐用这个
 
@@ -356,6 +359,7 @@ YouTube 的 `uploader/youtube_uploader/main.py` 里三处 `launch()` 全写着
 | `baijiahao` | 百家号 | 扫码 | — | 3:4 | | ✓ | |
 | `alipay` | 支付宝生活号 | 扫码 | — | 3:4 | | ✓ | 需先开通生活号权限 |
 | `youtube` | YouTube | 浏览器 | ≤100 | 16:9 | | | **必须挂代理**；支持播放列表/可见性 |
+| `tiktok` | TikTok | 扫码 | — | 3:4 | | | **sau CLI 里没有它**，走 vp-publish 自带驱动（见下） |
 
 「—」表示 sau 文档没写、我们也不猜——不裁剪，交给平台自己处理。
 真踩到坑了，在配置里覆盖：
@@ -363,6 +367,23 @@ YouTube 的 `uploader/youtube_uploader/main.py` 里三处 `launch()` 全写着
 ```json
 { "title_max": { "douyin": 55 } }
 ```
+
+### `tiktok` 为什么不一样
+
+它是唯一一个 `driver != "cli"` 的平台。sau 的命令行里**没有** `tiktok`
+这个子命令（实测 `sau tiktok` → `invalid choice: 'tiktok'`，可选值只有前 10 个），
+但仓库里 `uploader/tk_uploader/` 的实现是齐的 —— 上游写好了、忘了接进 argparse。
+
+所以 vp-publish 自带一个驱动脚本 `vp_publish/tk_driver.py` 代跑它。
+这个脚本**由 sau 的 python 执行**（不是被 import）：
+
+```
+<sau venv>/bin/python  <vp_publish/tk_driver.py>  login|upload  ...
+```
+
+因为 vp-publish 本身是零依赖的（用系统 python3 就能跑），而驱动需要
+playwright —— playwright 只装在 sau 的 venv 里。体检里的「sau 解释器」
+那一项就是在检查这个。**定时发布故意没接**（原因见第 39 条坑）。
 
 ---
 
@@ -479,7 +500,7 @@ sau 升级了也不连累它。
 
 **各平台登录实测现状**（2026-09-27）
 
-先说结论：**这 10 个平台在健康机器上全部可用**。下表是两轮实测合起来的 ——
+先说结论：**这 11 个平台在健康机器上全部可用**。下表是两轮实测合起来的 ——
 一轮在 Radxa 板子上（真 SBC），一轮在一台普通 x86 机器上（chromium 145）。
 两轮不一致的地方标出来了，那些是**那台板子自己的问题**，不是平台的问题。
 
@@ -493,6 +514,7 @@ sau 升级了也不连累它。
 | 虎扑 | ✅ | ✅ | 码文件名是 `_qq_qrcode`，**没有时间戳** |
 | 视频号 | ✅ | ❌ | 板子上渲染进程崩；同一份代码在普通机器上 1.3 秒出码 |
 | 百家号 | ✅ | ❌ | 板子上 `Target crashed`；普通机器正常出码 |
+| TikTok | ✅ 3.5 秒 | 未测 | sau CLI 里没有它，走自带驱动（见下） |
 | B站 | 要真终端 | 同左 | 走 biliup，硬性要求 `stdin/stdout` 都是 tty（第 35 条坑） |
 | YouTube | 要真 Chrome | 同左 | sau 写死了 `channel="chrome"`，chromium 顶不上 |
 
@@ -502,11 +524,26 @@ sau 升级了也不连累它。
 > 也就是说，「这个平台不可用」这个结论**本身是被坏盘污染的**，
 > 必须换一台健康机器复核才作数。复核结果就是上表第一列。
 
-**TikTok 根本不在 sau 的 CLI 里**（实测：`sau tiktok` →
-`invalid choice: 'tiktok'`，可选值只有上面那 10 个）。
-`uploader/tk_uploader/` 的代码是有的，但它的登录用的是 `await page.pause()`
-（Playwright Inspector），**必须有人在图形界面里点「继续」**，无头设备上走不通。
-要接它得先重写一个无头登录 —— 这是上游的活，vp-publish 不替它造轮子。
+**TikTok 是怎么接进来的**（2026-09-27 实测）：
+
+上游那版登录用的是 `await page.pause()`（Playwright Inspector），
+**必须有人在图形界面里点「继续」**，无头设备上走不通 —— 所以确实不能照抄。
+但「无头取不到码」这个结论是**错的**：
+
+```
+· 扫码页 https://www.tiktok.com/login/qrcode 直接就是二维码，不用先点「使用 QR 碼」
+· 码画在 <canvas> 上（不是 <img>，拿不到 src）—— 但 canvas 的元素截图走合成器，
+  不受 taint 限制，实测截得下来
+· 截出来的图用 opencv 能解回 https://www.tiktok.com/t/<id>/ —— 是真码
+· 登录态标记：出现 sessionid（扫码前只有 msToken/ttwid 等无关 cookie）
+· **码不会自己换**：盯着 canvas 采了 200 秒（40 次），画面一个像素都没变，
+  也就是有效期 ≥200 秒。所以不需要任何「检测过期 → 点刷新」的逻辑
+```
+
+所以驱动脚本自己写了个无头登录（约 60 行），**不依赖任何 UI 文案或类名**，
+比上游那版 `page.pause()` 更稳。实测 `Hub.start("tiktok")` 到出码 **3.5 秒**，
+产出 510×510 的 PNG（让浏览器按 3 倍设备像素比渲染，不是把小图拉大 ——
+170px 的原始 canvas 手机扫起来很难受）。
 
 **端到端编排**（`--dry-run`，5 个平台）：2.1 秒，各平台 argv 逐个核对无误。
 
@@ -516,6 +553,8 @@ sau 升级了也不连累它。
 > ⚠️ **未验证的一环**：扫码之后的实际上传。这需要人拿手机扫二维码，无法自动化。
 > 编排层、参数组装、封面生成、浏览器栈、登录出码全部实测通过；
 > 上传动作本身由 sau 完成，它是 15k★ 的成熟项目。
+> **TikTok 的上传还要多一层保留**：那段代码上游从没接进 CLI，也就没人端到端跑过，
+> 我们只是把它的类调起来（`--dry-run` 能看到完整的 argv）。
 
 ---
 
@@ -746,6 +785,58 @@ sau 升级了也不连累它。
     还有一个免费的：**用 git 当完整性检测器** ——
     `git status` 里冒出你没改过的 modified 文件，基本就是盘坏了。
 
+37. **「命令行里没有」不等于「不支持」**。TikTok 这件事两层都要纠正：
+    先是**断言错了** —— `sau tiktok` 报 `invalid choice` 就下结论「上游没做」，
+    但 `uploader/tk_uploader/` 里 `TiktokVideo.upload()`、`click_publish()`、
+    `detect_upload_status()` 全都在，是完整实现，只是没接进 argparse。
+    判断一个能力有没有，**要看 `uploader/` 目录，不能只看 `--help`**。
+
+    然后是**另一个方向的错**：找到实现就以为「照抄即可」。上游那版登录用的是
+    `await page.pause()` —— 它拉起 Playwright Inspector，必须有图形界面、
+    必须有人手点「继续」。无头设备、远程 SSH、板子上全都没法用。
+    所以「上游有实现」的正确用法是**读它的逻辑，自己写能跑的那一层**，
+    而不是把它的入口直接调起来。
+
+38. **`executable_path=""` 不是「用自带浏览器」，是「执行 `.`」**。
+    sau 的 `conf.py` 里 `LOCAL_CHROME_PATH = ""`，而 `TiktokVideo.upload()`
+    把它原样传给 `chromium.launch(executable_path=...)`。实测对照：
+
+    ```
+    executable_path=''   -> Error: BrowserType.launch: Failed to launch: spawn . ENOENT
+    executable_path=None -> OK
+    ```
+
+    playwright 只认 `None` 表示「用自带浏览器」，空字符串会被当成
+    **要执行的程序路径**。也就是说上游的 TikTok 上传**开箱即崩**。
+    驱动脚本里替它修掉了（`patch_empty_chrome_path()`，有单测守住）。
+    这类「空字符串被当成有效值」的坑，在配置驱动的代码里特别常见。
+
+39. **宁可少声明一个能力，也不要让用户的定时发布悄悄变成立即发布**。
+    TikTok 的上游实现里有 `set_schedule_time()`，但它依赖 TikTok Studio 的
+    英文 UI（`span.tiktok-timepicker-left` 之类）和 `datetime.strptime(month, '%B')`，
+    **没有任何端到端验证**。所以 `platforms.py` 里 TikTok 的 `caps`
+    **故意不含 `SCHEDULE`**。
+
+    如果声明了，用户在 `--schedule` 里写了「明天 16:00」，而那段代码
+    在中文界面上静默失败，视频就**当场发出去了** —— 这比明说「不支持」
+    坏得多。这条和标题裁剪那条是同一个原则：**不确定的时候，不替用户做决定**。
+
+40. **环境导致的失败，要用 A/B 对照定性，别急着改代码**。
+    本地跑 `e2e_loginweb.sh` 时一堆 `curl: (52) Empty reply from server`，
+    看起来像我改坏了分发逻辑。做法是：把 **改动前的版本**
+    （`git show HEAD:tests/e2e_loginweb.sh`）用**同样的方式**跑一遍 ——
+    它一模一样地失败（同样 7 次 `Empty reply`），于是结论是
+    「环境限制」，不是「我引入的 bug」。
+
+    根因有两层，都是 Windows/MSYS 的：假 sau 是个 `#!/bin/sh` 脚本，
+    Windows 执行不了（`WinError 193`），所以 `Popen` 抛异常、请求没有响应；
+    另外 Windows 自带的 curl 不认 MSYS 的 `/dev/null`
+    （`curl: (23) client returned ERROR on write`）。
+    那个 e2e 本来就是给 Linux CI 写的。
+
+    **先证伪「是我改坏的」，再去找真原因** —— 否则会去修一个不存在的问题，
+    还会把本来正确的代码改错。
+
 ---
 
 ## 目录结构
@@ -767,10 +858,11 @@ vp-publish/
 │   ├── state.py               # 幂等记录
 │   ├── watch.py               # 守护模式：等文件写完、库存保护、失败不重试
 │   ├── loginweb.py            # 扫码登录网页（零外部请求，过期一键换）
+│   ├── tk_driver.py           # TikTok 驱动（sau CLI 里没有它，用 sau 的 python 跑）
 │   ├── config.py              # 配置（零依赖 JSON）
 │   └── report.py              # 表格渲染（含中文宽度）
 └── tests/
-    ├── test_vp_publish.py     # 104 项单元测试
+    ├── test_vp_publish.py     # 129 项单元测试
     ├── e2e_watch.sh           # watch 跨轮行为演练（假 sau）
     ├── e2e_loginweb.sh        # 扫码网页演练（真 HTTP + 真 PNG）
     ├── reach_probe.py         # 实测各平台可达性
@@ -782,7 +874,7 @@ vp-publish/
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v   # 104 项单元测试
+python3 -m unittest discover -s tests -v   # 129 项单元测试
 bash tests/e2e_watch.sh                    # watch 跨轮行为演练（假 sau，几秒跑完）
 bash tests/e2e_loginweb.sh                 # 扫码网页演练（真起 HTTP 服务，约半分钟）
 ```

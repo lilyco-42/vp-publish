@@ -408,7 +408,7 @@ def cmd_publish(args, cfg: config_mod.Config) -> int:
     opts.schedule = validate_schedule(opts.schedule)
 
     sau_path = sau.find_sau(cfg)
-    if sau_path is None and not opts.dry_run:
+    if not sau.backend_ok(cfg) and not opts.dry_run:
         die(sau.sau_problem(cfg))
 
     available = sau.discover_accounts(cfg)
@@ -500,7 +500,7 @@ def cmd_watch(args, cfg: config_mod.Config) -> int:
             "  或者配到 config 的 watch_dirs")
 
     sau_path = sau.find_sau(cfg)
-    if sau_path is None:
+    if not sau.backend_ok(cfg):
         die(sau.sau_problem(cfg))
 
     opts = Options(
@@ -750,13 +750,18 @@ def cmd_login(args, cfg: config_mod.Config) -> int:
         die(f"认不出平台名：{args.platform}\n"
             f"  可用：{', '.join(p.key for p in platforms.PLATFORMS)}")
     plat = platforms.BY_KEY[key]
-    sau_path = sau.find_sau(cfg)
-    if sau_path is None:
-        die(sau.sau_problem(cfg))
 
     available = sau.discover_accounts(cfg)
     account = sau.resolve_account(cfg, key, override=args.account,
                                   available=available)
+
+    # 登录命令由 `sau.login_command` 统一给 —— 它按平台决定「调 sau CLI」
+    # 还是「跑 vp-publish 自带的驱动脚本」。网页端走的是同一个函数，
+    # 所以两条路径不会分裂。缺东西时它会把「缺哪一样」说清楚。
+    headless = not args.headed
+    argv, problem = sau.login_command(cfg, key, account, headless=headless)
+    if argv is None:
+        die(problem)
 
     acct_file = sau.account_file(cfg, key, account)
     before = acct_file.stat().st_mtime if acct_file.is_file() else 0.0
@@ -770,15 +775,17 @@ def cmd_login(args, cfg: config_mod.Config) -> int:
             "二维码会打印在下面")
     if plat.login == "browser" and not args.headed:
         say("  · 这个平台要在浏览器里操作，建议加 --headed 看得到窗口")
+    if plat.driver != platforms.DRIVER_CLI:
+        say(f"  · 这个平台 sau 的命令行里没有，由 vp-publish 自带的驱动代跑"
+            f"（要用 sau 的 python）")
     say("  · sau 会把二维码直接打印在下面（没有的话看最后打印的图片路径）")
     say()
 
     since = time.time()
-    headless = not args.headed
     # 注意：这一步的输出**直接透传到你的终端**（含二维码），不经过我们捕获。
     # 见 sau.run_stream() 的注释 —— 早期版本捕获了输出，二维码被吞掉，
     # 用户在终端上什么都看不到，只能干等超时。
-    res = sau.login(sau_path, key, account, cfg, headless=headless)
+    res = sau.run_stream(argv, cfg, timeout=max(cfg.timeout, 900))
 
     # 成功判据：账号文件被创建/更新（因为输出被透传，拿不到文本）
     after = acct_file.stat().st_mtime if acct_file.is_file() else 0.0

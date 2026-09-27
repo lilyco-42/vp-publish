@@ -24,7 +24,11 @@
 #      不等于「B站 能用」，前提是这台机器能连 GitHub。
 #  11. **YouTube 只认真 Chrome** —— sau 的 youtube_uploader 三处 launch() 全写着
 #      channel="chrome"，chromium 顶不上。
-#      第 10、11 条会在最后一步（7/7）报出来，不用等到上传那一刻才发现。
+#  12. **TikTok 不在 sau 的 CLI 里** —— `sau tiktok` 会报 invalid choice，
+#      但 uploader/tk_uploader/ 的实现是齐的（上游写好了、没接进 argparse）。
+#      vp-publish 自带驱动代跑它，驱动要用 **sau 那个 venv 的解释器**
+#      （playwright 在里头；vp-publish 自己是零依赖的）。
+#      第 10、11、12 条会在最后一步（7/7）报出来，不用等到上传那一刻才发现。
 #
 # 用法：
 #   bash bootstrap.sh              # 装到默认位置（~/sau）
@@ -101,6 +105,14 @@ if [ "$MODE" = "check" ]; then
     note "没装真 Chrome —— YouTube 发不了"
     note "  sau 的 youtube_uploader 写死了 channel=\"chrome\"，chromium 顶不上"
     note "  修：./vp-publish doctor 会告诉你缺什么"
+  fi
+  # TikTok 走 vp-publish 自带的驱动，要的是 sau 那个解释器（playwright 在里头）。
+  # 注意两个路径都要看：Linux/macOS 是 bin/python，Windows 是 Scripts/python.exe。
+  if [ -x "$SAU_ROOT/.venv/bin/python" ] || [ -x "$SAU_ROOT/.venv/Scripts/python.exe" ]; then
+    ok "sau 的解释器可用（TikTok 可用）"
+  else
+    note "没找到 sau 的 venv 解释器 —— TikTok 发不了"
+    note "  找过：$SAU_ROOT/.venv/{bin/python,Scripts/python.exe}"
   fi
   command -v ffmpeg >/dev/null && ok "ffmpeg 可用（能自动生成封面）" || note "没有 ffmpeg（封面功能会跳过，不影响上传）"
   exit 0
@@ -295,9 +307,23 @@ done
 if [ -n "$CHROME_BIN" ]; then
   ok "真 Chrome 已在：$CHROME_BIN（YouTube 可用）"
 else
-  note "没有真 Chrome —— YouTube 发不了（其他 9 个平台不受影响）"
+  note "没有真 Chrome —— YouTube 发不了（其他 10 个平台不受影响）"
   note "  原因：sau 的 youtube_uploader 把 channel=\"chrome\" 写死了，chromium 顶不上"
   note "  装完 Chrome 后 ./vp-publish doctor 会显示 YouTube 就绪"
+fi
+
+# TikTok 不经过 sau 的命令行（上游只写了 uploader/tk_uploader/，没接进 argparse），
+# 由 vp-publish 自带的驱动脚本代跑。驱动**必须用 sau 那个 venv 的解释器** ——
+# playwright 装在里头，vp-publish 自己是零依赖的。
+SAU_PY=""
+for c in "$SAU_ROOT/.venv/bin/python" "$SAU_ROOT/.venv/Scripts/python.exe"; do
+  [ -x "$c" ] && SAU_PY="$c" && break
+done
+if [ -n "$SAU_PY" ]; then
+  ok "sau 的解释器已在：$SAU_PY（TikTok 可用）"
+else
+  note "没找到 sau 的 venv 解释器 —— TikTok 发不了"
+  note "  找过：$SAU_ROOT/.venv/bin/python、$SAU_ROOT/.venv/Scripts/python.exe"
 fi
 
 cat <<EOF

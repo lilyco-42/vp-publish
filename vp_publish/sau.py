@@ -46,6 +46,123 @@ def sau_problem(cfg: Config) -> str:
     )
 
 
+# ── 自带驱动（sau CLI 里没有的平台）──────────────────────────────
+# 为什么需要「另一个解释器」：vp-publish 是零依赖的（用系统 python3 就能跑），
+# 而 TikTok 需要 playwright —— playwright 只装在 sau 的 venv 里。
+# 所以驱动脚本是**由 sau 的 python 执行**的，不是被 import 的。
+_PY_NAMES = ("python", "python3", "python.exe")
+
+
+def find_sau_python(cfg: Config) -> Path | None:
+    """找 sau 那个 venv 的解释器。
+
+    三个来源，按可靠程度排：
+      1. 配置里写死的 `sau.python`（默认 ~/sau/.venv/bin/python）
+      2. **sau 可执行文件旁边**的 python —— 同一个 bin/Scripts 目录，
+         这个最可靠：能找到 sau 就一定能找到它旁边的 python
+      3. venv 的两个常规位置：POSIX 的 bin/python、Windows 的 Scripts/python.exe
+
+    第 3 条里的 Windows 位置不能省：配置默认值写的是 POSIX 路径
+    （bin/python），在 Windows 上永远不存在，只试第 1 条会必然失败。
+    """
+    cands: list[Path] = []
+    if cfg.sau.python:
+        cands.append(cfg.sau.python)
+    sau_path = find_sau(cfg)
+    if sau_path is not None:
+        cands += [sau_path.parent / n for n in _PY_NAMES]
+    for sub in ("bin", "Scripts"):
+        cands += [cfg.sau.root / ".venv" / sub / n for n in _PY_NAMES]
+    for cand in cands:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def backend_ok(cfg: Config) -> bool:
+    """有没有可用的后端。
+
+    判据是「有 CLI **或** 有解释器」，不是「有 CLI」——
+    TikTok 走自带驱动，它要的是解释器，不是那个可执行文件。
+    只认 CLI 的话，一台「venv 在但没装 console script」的机器
+    会被整机拒掉，而它其实能发 TikTok。
+    """
+    return find_sau(cfg) is not None or find_sau_python(cfg) is not None
+
+
+def driver_script(driver: str) -> Path | None:
+    """驱动脚本的路径。按约定推：vp_publish/<driver>_driver.py。
+
+    约定优于配置 —— 加新驱动只要往包里放一个同名文件，
+    platforms.py 里写个 driver 值就行，这里一行都不用改。
+    """
+    if not driver or driver == platforms.DRIVER_CLI:
+        return None
+    path = Path(__file__).resolve().parent / f"{driver}_driver.py"
+    return path if path.is_file() else None
+
+
+def driver_problem(cfg: Config, plat: platforms.Platform) -> str:
+    """驱动平台跑不起来时，说清缺的是哪一样。"""
+    bits = [f"{plat.label}（{plat.key}）的活由 vp-publish 自带的驱动脚本干"
+            f"（sau 的命令行里没有这个平台）。"]
+    if driver_script(plat.driver) is None:
+        bits.append(f"✗ 驱动脚本不见了：vp_publish/{plat.driver}_driver.py"
+                    f" —— 重装一下 vp-publish（pip install -e .）")
+    if find_sau_python(cfg) is None:
+        bits.append(f"✗ 没找到 sau 的 venv 解释器（驱动脚本要用它跑，"
+                    f"playwright 装在里头）。\n"
+                    f"    找过：{cfg.sau.python}、sau 可执行文件旁边、"
+                    f"{cfg.sau.root}/.venv/{{bin,Scripts}}/python\n"
+                    f"    一键装：bash bootstrap.sh")
+    return "\n  ".join(bits)
+
+
+# 等扫码的秒数。给足 —— 掏手机、开 App、对准屏幕都要时间。
+DRIVER_LOGIN_WAIT = 300
+
+
+def build_driver_login_argv(cfg: Config, plat: platforms.Platform, account: str,
+                            *, headless: bool = True) -> list[str] | None:
+    """组装「自带驱动」的登录命令。缺东西就返回 None（由调用方解释）。"""
+    py = find_sau_python(cfg)
+    script = driver_script(plat.driver)
+    if py is None or script is None:
+        return None
+    return [
+        str(py), str(script), "login",
+        "--account-file", str(account_file(cfg, plat.key, account)),
+        "--qr-dir", str(cfg.sau.cookies_dir),
+        # 前缀 = `{平台}_{账号}`，跟 sau 自己出码的命名对齐，
+        # 这样 qr_glob 那一套（网页端 / 命令行）不用为驱动平台写特例。
+        "--qr-prefix", f"{plat.key}_{account}",
+        "--wait", str(DRIVER_LOGIN_WAIT),
+        "--headless" if headless else "--headed",
+    ]
+
+
+def build_driver_upload_argv(cfg: Config, plat: platforms.Platform, account: str,
+                             video: Path, meta, covers: dict[str, Path],
+                             *, headless: bool = True) -> list[str] | None:
+    py = find_sau_python(cfg)
+    script = driver_script(plat.driver)
+    if py is None or script is None:
+        return None
+    argv = [
+        str(py), str(script), "upload",
+        "--sau-root", str(cfg.sau.root),
+        "--account-file", str(account_file(cfg, plat.key, account)),
+        "--file", str(video),
+        "--title", meta.title,
+        "--desc", meta.desc or meta.title,
+    ]
+    if meta.tags:
+        argv += ["--tags", ",".join(meta.tags)]
+    if covers.get("thumbnail"):
+        argv += ["--thumbnail", str(covers["thumbnail"])]
+    return argv
+
+
 # ── 账号发现 ────────────────────────────────────────────────────
 _ACCOUNT_RE = re.compile(r"^(?P<platform>[a-z0-9]+)_(?P<account>.+)\.json$")
 
@@ -293,9 +410,27 @@ def run(argv: list[str], cfg: Config, *, cwd: Path | None = None,
     )
 
 
-def upload(sau: Path, plat: platforms.Platform, account: str, video: Path,
+def upload(sau: Path | None, plat: platforms.Platform, account: str, video: Path,
            meta, covers: dict[str, Path], cfg: Config,
            *, headless: bool = True, dry_run: bool = False) -> RunResult:
+    """上传的统一出口。按 `plat.driver` 决定调 sau CLI 还是跑自带驱动。
+
+    上层（publish / watch）只认这一个函数，所以两条路径的
+    结果格式、超时、错误处理全都一致。
+    """
+    if plat.driver != platforms.DRIVER_CLI:
+        argv = build_driver_upload_argv(cfg, plat, account, video, meta, covers,
+                                        headless=headless)
+        if argv is None:
+            return RunResult(ok=False, code=-3,
+                             reason=driver_problem(cfg, plat).replace("\n", " "))
+        if dry_run:
+            return RunResult(ok=True, argv=argv, reason="dry-run（没真发）")
+        return run(argv, cfg)
+
+    if sau is None:
+        return RunResult(ok=False, code=-3,
+                         reason=sau_problem(cfg).replace("\n", " "))
     argv = build_upload_argv(sau, plat, account, video, meta, covers, cfg,
                              headless=headless)
     if dry_run:
@@ -313,6 +448,29 @@ def login(sau: Path, plat_key: str, account: str, cfg: Config,
     # 登录要人扫码/输账号，给足时间；且必须用 run_stream 让二维码透传到终端
     return run_stream(build_login_argv(sau, plat_key, account, headless=headless),
                       cfg, timeout=max(cfg.timeout, 900))
+
+
+def login_command(cfg: Config, plat_key: str, account: str, *,
+                  headless: bool = True,
+                  sau_path: Path | None = None) -> tuple[list[str] | None, str]:
+    """登录命令的统一出口。返回 `(argv, 问题说明)`；argv 为 None 表示跑不了。
+
+    **命令行和网页都必须走这里** —— 否则会出现「网页里点了没反应、
+    命令行却能用」这种最难查的分裂（TikTok 就是这种平台：
+    它压根不经过 sau CLI）。
+    """
+    plat = platforms.BY_KEY.get(plat_key)
+    if plat is not None and plat.driver != platforms.DRIVER_CLI:
+        argv = build_driver_login_argv(cfg, plat, account, headless=headless)
+        if argv is None:
+            return None, driver_problem(cfg, plat)
+        return argv, ""
+
+    if sau_path is None:
+        sau_path = find_sau(cfg)
+    if sau_path is None:
+        return None, sau_problem(cfg)
+    return build_login_argv(sau_path, plat_key, account, headless=headless), ""
 
 
 def qr_glob(cfg: Config, plat_key: str, account: str) -> str:
