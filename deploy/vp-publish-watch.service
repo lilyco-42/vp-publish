@@ -8,10 +8,11 @@ Wants=network-online.target
 Type=simple
 # 没有已登录的平台时它不会退出，只会空转等着 —— 所以不会变成重启死循环。
 # 真正的错误（比如找不到 sau）会退出，RestartSec=30 会把它拖住，不会刷日志。
-ExecStart=%h/vp-publish/vp-publish watch %h/vp/videos --log %h/vp-publish/watch.log
+# 日志写进状态目录（不要写进仓库目录 —— git clean 会连它一起删掉）。
+# 同时也进 journal：journalctl --user -u vp-publish-watch -f
+ExecStart=%h/vp-publish/vp-publish watch %h/vp/videos --log %h/.local/state/vp-publish/watch.log
 Restart=always
 RestartSec=30
-# 日志进 journal：journalctl --user -u vp-publish-watch -f
 StandardOutput=journal
 StandardError=journal
 

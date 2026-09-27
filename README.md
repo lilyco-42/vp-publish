@@ -157,6 +157,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now vp-publish-watch
 loginctl enable-linger $USER          # 没登录也跑（板子重启后有效）
 journalctl --user -u vp-publish-watch -f   # 看它在干什么
+# 日志也落在 ~/.local/state/vp-publish/watch.log（故意不写进仓库目录）
 ```
 
 **三个关键设计**（都是踩过才加的，改代码前先看）：
