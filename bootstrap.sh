@@ -19,6 +19,12 @@
 #   8. npmmirror 的 playwright 镜像路径已失效（返回阿里云错误 XML）
 #      → 必须用官方 CDN cdn.playwright.dev（实测 2MB/s）。
 #   9. patchright 和 playwright 各要一套 chromium，都要装。
+#  10. **B站 的 biliup 不是 pip 包** —— sau 会从 GitHub Releases 自动下载它的
+#      Rust 二进制（uploader/bilibili_uploader/runtime.py）。所以「装完 sau」
+#      不等于「B站 能用」，前提是这台机器能连 GitHub。
+#  11. **YouTube 只认真 Chrome** —— sau 的 youtube_uploader 三处 launch() 全写着
+#      channel="chrome"，chromium 顶不上。
+#      第 10、11 条会在最后一步（7/7）报出来，不用等到上传那一刻才发现。
 #
 # 用法：
 #   bash bootstrap.sh              # 装到默认位置（~/sau）
@@ -77,12 +83,31 @@ if [ "$MODE" = "check" ]; then
     && ok "patchright 已装" || bad "缺 patchright"
   ls "$HOME/.cache/ms-playwright"/chromium-* >/dev/null 2>&1 \
     && ok "chromium 已下载" || bad "chromium 未下载"
+  # 平台额外依赖（B站 要 biliup 的二进制，YouTube 要真 Chrome）
+  BILIUP_BIN="$HOME/.social-auto-upload/tools/biliup"
+  if [ -d "$BILIUP_BIN" ]; then
+    ok "biliup 已下载（B站 可用）"
+  else
+    note "biliup 未下载 —— B站 首次登录时 sau 会自己去 GitHub Releases 下"
+    note "  前提是这台机器能连 GitHub；连不上就先配代理"
+  fi
+  CHROME_BIN=""
+  for c in /opt/google/chrome/chrome /usr/bin/google-chrome /usr/bin/google-chrome-stable; do
+    [ -x "$c" ] && CHROME_BIN="$c" && break
+  done
+  if [ -n "$CHROME_BIN" ]; then
+    ok "真 Chrome 已装：$CHROME_BIN（YouTube 可用）"
+  else
+    note "没装真 Chrome —— YouTube 发不了"
+    note "  sau 的 youtube_uploader 写死了 channel=\"chrome\"，chromium 顶不上"
+    note "  修：./vp-publish doctor 会告诉你缺什么"
+  fi
   command -v ffmpeg >/dev/null && ok "ffmpeg 可用（能自动生成封面）" || note "没有 ffmpeg（封面功能会跳过，不影响上传）"
   exit 0
 fi
 
 # ── 1. 系统依赖 ─────────────────────────────────────────────────
-step "1/6 系统依赖"
+step "1/7 系统依赖"
 if [ "$SKIP_APT" = "1" ]; then
   note "SKIP_APT=1，跳过"
 else
@@ -121,7 +146,7 @@ fi
 command -v git >/dev/null 2>&1 || { bad "还是没有 git，装不了 sau"; exit 1; }
 
 # ── 2. 克隆 sau ─────────────────────────────────────────────────
-step "2/6 获取 social-auto-upload"
+step "2/7 获取 social-auto-upload"
 if [ -d "$SAU_ROOT/.git" ]; then
   ok "已存在：$SAU_ROOT（不重新克隆）"
 else
@@ -131,7 +156,7 @@ else
 fi
 
 # ── 3. 虚拟环境 ─────────────────────────────────────────────────
-step "3/6 虚拟环境"
+step "3/7 虚拟环境"
 if [ ! -x "$SAU_ROOT/.venv/bin/python" ]; then
   python3 -m venv "$SAU_ROOT/.venv" || {
     bad "建 venv 失败。若提示 ensurepip，说明缺 python3-venv"
@@ -144,7 +169,7 @@ PIP="$SAU_ROOT/.venv/bin/pip"
 ok "venv 就绪（$($PY -V 2>&1)）"
 
 # ── 4. 装 sau ───────────────────────────────────────────────────
-step "4/6 安装 sau 及其依赖"
+step "4/7 安装 sau 及其依赖"
 PYVER="$($PY -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
 note "sau 声明 requires-python >=3.10,<3.13，本机是 $PYVER"
 note "→ 依赖（loguru/opencv/patchright/requests/qrcode/segno）在 3.13 上都正常，"
@@ -202,7 +227,7 @@ if changed:
 PYEOF
 
 # ── 5. 浏览器 ───────────────────────────────────────────────────
-step "5/6 浏览器（patchright + playwright 各一套）"
+step "5/7 浏览器（patchright + playwright 各一套）"
 if [ -n "$PLAYWRIGHT_HOST" ]; then
   export PLAYWRIGHT_DOWNLOAD_HOST="$PLAYWRIGHT_HOST"
   note "下载源：$PLAYWRIGHT_HOST"
@@ -229,7 +254,7 @@ else
 fi
 
 # ── 6. 自检 ─────────────────────────────────────────────────────
-step "6/6 自检"
+step "6/7 自检"
 "$SAU_ROOT/.venv/bin/sau" --help >/dev/null 2>&1 \
   && ok "sau 命令可用" \
   || { bad "sau 命令不可用，跑一下它看报什么错：$SAU_ROOT/.venv/bin/sau --help"; exit 1; }
@@ -253,6 +278,28 @@ async def main():
 asyncio.run(main())
 PYEOF
 
+# ── 7. 平台额外依赖（光有 sau 不够的那两个）──────────────────────
+step "7/7 平台额外依赖"
+BILIUP_ROOT="$HOME/.social-auto-upload/tools/biliup"
+if [ -d "$BILIUP_ROOT" ]; then
+  ok "biliup 已在：$BILIUP_ROOT（B站 可用）"
+else
+  note "biliup 还没有 —— B站 第一次登录时 sau 会自己去 GitHub Releases 下载"
+  note "  下不下得来取决于这台机器能不能连 GitHub；连不上就先配好代理"
+fi
+
+CHROME_BIN=""
+for c in /opt/google/chrome/chrome /usr/bin/google-chrome /usr/bin/google-chrome-stable; do
+  [ -x "$c" ] && CHROME_BIN="$c" && break
+done
+if [ -n "$CHROME_BIN" ]; then
+  ok "真 Chrome 已在：$CHROME_BIN（YouTube 可用）"
+else
+  note "没有真 Chrome —— YouTube 发不了（其他 9 个平台不受影响）"
+  note "  原因：sau 的 youtube_uploader 把 channel=\"chrome\" 写死了，chromium 顶不上"
+  note "  装完 Chrome 后 ./vp-publish doctor 会显示 YouTube 就绪"
+fi
+
 cat <<EOF
 
 装完了。下一步：
@@ -267,8 +314,10 @@ cat <<EOF
        ./vp-publish login douyin --headed
        ./vp-publish login xiaohongshu --headed
        ./vp-publish login bilibili --headed
+     ⚠ B站 的登录**必须在真终端里**跑（sau 用的 biliup 要求 tty），
+       网页里做不了 —— 网页上那张卡片是灰的，点不动。
 
-  3) 看看能发到哪
+  3) 看看能发到哪（会告诉你哪个平台还缺东西）
        ./vp-publish doctor
 
   4) 发
