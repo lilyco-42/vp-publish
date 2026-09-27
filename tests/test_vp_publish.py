@@ -782,5 +782,51 @@ class TestWatchDescribe(unittest.TestCase):
         self.assertNotIn("失败", line)
 
 
+class TestWatchNoPlatform(unittest.TestCase):
+    """「一个平台都没登录」时 watch 该怎么办。
+
+    两件事必须同时成立，而且它们是连在一起的：
+      ① 不能退出 —— 常驻服务会变成 systemd 重启死循环（cookie 全过期时同样）；
+      ② 更不能「假装发了」—— 目标为空时如果算成功，视频会被静默标记成
+         「已发布」永久跳过，而且毫无痕迹。
+    """
+
+    def test_publish_one_video_with_no_targets_is_not_ok(self):
+        from vp_publish import cli
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("XDG_STATE_HOME")
+            os.environ["XDG_STATE_HOME"] = tmp
+            try:
+                out = cli.publish_one_video(
+                    Path(tmp) / "v.mp4", Config(), targets=[], available={},
+                    sau_path=None, opts=cli.Options(quiet=True),
+                    store=state.Store())
+            finally:
+                if old is None:
+                    os.environ.pop("XDG_STATE_HOME", None)
+                else:
+                    os.environ["XDG_STATE_HOME"] = old
+        self.assertFalse(out["ok"], "目标为空绝不能算成功")
+        self.assertEqual(out["attempted"], 0)
+        self.assertEqual(out["statuses"], [])
+
+    def test_watch_discovers_platforms_inside_the_loop(self):
+        """平台探测必须在 while 循环里 —— 扫码登录后不该需要重启服务。"""
+        from vp_publish import cli
+        src = inspect.getsource(cli.cmd_watch)
+        self.assertIn("while True", src)
+        self.assertGreater(
+            src.index("discover_accounts"), src.index("while True"),
+            "平台探测写在了循环外面：登录后必须重启服务才能生效")
+        self.assertNotIn("守护起来也没用", src,
+                         "没有平台时不该退出（常驻服务会重启死循环）")
+
+    def test_watch_does_not_mark_state_without_statuses(self):
+        from vp_publish import cli
+        src = inspect.getsource(cli.cmd_watch)
+        self.assertIn('not out["statuses"]', src,
+                      "缺少「什么都没发就不记状态」的兜底")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

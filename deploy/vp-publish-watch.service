@@ -1,0 +1,19 @@
+[Unit]
+Description=vp-publish watch —— 盯着目录自动发视频
+Documentation=https://github.com/lilyco-42/vp-publish
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 没有已登录的平台时它不会退出，只会空转等着 —— 所以不会变成重启死循环。
+# 真正的错误（比如找不到 sau）会退出，RestartSec=30 会把它拖住，不会刷日志。
+ExecStart=%h/vp-publish/vp-publish watch %h/vp/videos --log %h/vp-publish/watch.log
+Restart=always
+RestartSec=30
+# 日志进 journal：journalctl --user -u vp-publish-watch -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

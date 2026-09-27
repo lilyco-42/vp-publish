@@ -141,27 +141,22 @@ ln -s "$PWD/vp-publish" ~/bin/vp-publish
 ```
 
 它每 30 秒扫一次目录，发现**写完了**的新视频就发到所有已登录平台，
-并把结果记进状态文件。跑成常驻服务：
+并把结果记进状态文件。
+
+**推荐的使用顺序是「先把服务跑起来，再慢慢登录」** —— watch 在没有已登录平台时
+**不会退出**，只会空转等着；你哪天扫码登录了，它下一轮就自动开始工作，
+**不用重启服务**。而且这期间它**什么都不登记**，所以那些积压的老视频
+在你登录后仍然会被当作库存跳过，不会被一次性发出去。
+
+跑成常驻服务（仓库里带了 `deploy/vp-publish-watch.service`）：
 
 ```bash
-# systemd 用户服务（推荐，重启后自动拉起）
 mkdir -p ~/.config/systemd/user
-cat > ~/.config/systemd/user/vp-publish-watch.service <<'EOF'
-[Unit]
-Description=vp-publish watch
-After=network-online.target
-
-[Service]
-ExecStart=%h/vp-publish/vp-publish watch %h/vp/videos --log %h/vp-publish/watch.log
-Restart=always
-RestartSec=30
-
-[Install]
-WantedBy=default.target
-EOF
+cp deploy/vp-publish-watch.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now vp-publish-watch
 loginctl enable-linger $USER          # 没登录也跑（板子重启后有效）
+journalctl --user -u vp-publish-watch -f   # 看它在干什么
 ```
 
 **三个关键设计**（都是踩过才加的，改代码前先看）：
@@ -169,13 +164,14 @@ loginctl enable-linger $USER          # 没登录也跑（板子重启后有效�
 | 行为 | 为什么 |
 |---|---|
 | **连续 2 轮大小不变**才认为写完 | 正在写入的视频会先出现半截文件。只判「文件存在」会把半截视频发出去，而且要等平台审核失败才发现。旁边的 `.json` 元数据没写完也一样等。 |
-| **首次启动只登记、不发布** | 如果目录里存了 50 条老视频，一启动全发出去是灾难。要发库存得显式 `--publish-backlog`。 |
+| **库存按文件保护**（首次见到即定） | 如果目录里存了 50 条老视频，一启动全发出去是灾难。要发库存得显式 `--publish-backlog`。**注意这里不能用「首次启动」这种全局开关** —— 见下面第 21 条坑。 |
+| **没有已登录平台时不退出** | 退出 + systemd `Restart=always` = **重启死循环**（实测 32 秒内就重启了一次，日志被同一句报错刷满）。而且 cookie 全过期时会自动进入这个状态。 |
 | **失败不自动重试** | 一条坏视频不该把后面全部堵住，也不该在平台侧反复触发风控。要重发：`./vp-publish forget <视频>`，下一轮自然会捡起来。 |
 
 常用参数：
 
 ```bash
-./vp-publish watch ~/vp/videos --once            # 只扫一轮（调试用）
+./vp-publish watch ~/vp/videos --once            # 只扫一轮（调试用；无平台时退出码 2）
 ./vp-publish watch ~/vp/videos --dry-run         # 看会发什么，不真发
 ./vp-publish watch ~/vp/videos --publish-backlog # 连库存一起发
 ./vp-publish watch ~/vp/videos --interval 60     # 轮询间隔
@@ -509,6 +505,19 @@ sau 升级了也不连累它。
     **写一个调用日志文件**，再从日志判断 —— 第一版 e2e 就是因为 grep stdout
     而全线假绿。
 
+24. **常驻服务「没有可做的事」时不能退出**。最初 `watch` 在一个平台都没登录时
+    直接 `die()`。单独跑看着挺合理（提示清楚、退出码 2），但配上
+    systemd 的 `Restart=always` 就是**重启死循环** —— 实测 32 秒内 `NRestarts`
+    就从 0 变 1，日志被同一句报错刷满。而且这不是边缘情况：**cookie 全部过期时
+    会自动进入这个状态**。正确做法是空转等着（登录后下一轮自动开始工作），
+    并且这期间**什么都不登记**，这样积压的老视频在登录后仍受库存保护。
+
+25. **`publish_one_video` 在「目标平台为空」时绝不能返回成功**。否则
+    `any_fail` 保持 False → `ok=True` → 视频被记成「已发布」→ **永久跳过，
+    而且日志里毫无痕迹**。第 24 条修完就会踩上这个：没有平台时不退出了，
+    于是每个新视频都被静默标记成已发。两个坑必须一起修。
+    返回里加 `attempted` 字段，调用方据此判断「到底有没有平台真的被尝试过」。
+
 ---
 
 ## 目录结构
@@ -518,6 +527,8 @@ vp-publish/
 ├── vp-publish                 # 入口（免安装，直接跑）
 ├── publish-all                # 同一个东西的别名
 ├── bootstrap.sh               # 一键装环境
+├── deploy/
+│   └── vp-publish-watch.service  # systemd 用户服务（守护模式常驻）
 ├── vp_publish/
 │   ├── cli.py                 # 命令行、发布主流程
 │   ├── platforms.py           # 平台能力矩阵（照着 argparse 核出来的）
@@ -530,7 +541,7 @@ vp-publish/
 │   ├── config.py              # 配置（零依赖 JSON）
 │   └── report.py              # 表格渲染（含中文宽度）
 └── tests/
-    ├── test_vp_publish.py     # 77 项单元测试
+    ├── test_vp_publish.py     # 80 项单元测试
     ├── e2e_watch.sh           # watch 跨轮行为演练（假 sau）
     ├── reach_probe.py         # 实测各平台可达性
     └── reach_proxy.py         # 实测 YouTube 走代理
@@ -541,7 +552,7 @@ vp-publish/
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v   # 77 项单元测试
+python3 -m unittest discover -s tests -v   # 80 项单元测试
 bash tests/e2e_watch.sh                    # 端到端演练（假 sau，几秒跑完）
 ```
 
@@ -551,7 +562,8 @@ bash tests/e2e_watch.sh                    # 端到端演练（假 sau，几秒�
 
 `tests/e2e_watch.sh` 是**跨轮**行为的演练 —— watch 的坑全在「第 N 轮和第 N+1 轮
 之间」，单测覆盖不到：库存保护、等文件写完、幂等、失败不重试、dry-run 不脏状态、
-forget 后能重发。它用假 sau，不碰网络、不发任何东西，**CI 里也跑**。
+forget 后能重发，以及**「服务先上线、后登录」**（不退出、不脏状态、库存仍受保护、
+登录后免重启自动开始）。共 38 条断言。它用假 sau，不碰网络、不发任何东西，**CI 里也跑**。
 第 21 条坑就是它抓出来的。
 
 不覆盖「真实上传」——那个需要人扫码，见「实测数据」一节。

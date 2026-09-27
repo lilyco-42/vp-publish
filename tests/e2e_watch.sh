@@ -152,6 +152,71 @@ if [ -f "$CUSTOM" ]; then ok "--state 生效（文件已创建）"; else bad "--
 ( cd "$REPO" && "$PY" ./vp-publish forget --state "$CUSTOM" \
     "$BASE/videos/2026-09-27-新片.mp4" ) 2>&1 | sed 's/^/    /'
 
+# ── 8. 服务先上线、后登录（最实际的使用顺序）─────────────────────
+#
+# 真实流程是：先把 systemd 服务装好跑起来，过几天才想起来扫码登录。
+# 所以必须做到三件事：
+#   · 没有平台时**不退出**（退出 + Restart=always = 重启死循环）
+#   · 也不登记任何东西（baseline_done 不能翻，否则积压的老视频会失去保护）
+#   · 登录后自动开始工作，**不用重启服务**
+note "8. 服务先上线、后登录"
+B2="$BASE/b2"
+mkdir -p "$B2/sau/cookies" "$B2/videos" "$B2/state"
+cp "$BASE/sau/sau" "$B2/sau/sau"; chmod +x "$B2/sau/sau"
+head -c 300000 /dev/urandom > "$B2/videos/2026-09-01-积压老片.mp4"
+cat > "$B2/config.json" <<EOF
+{ "sau": { "root": "$B2/sau", "bin": "$B2/sau/sau" },
+  "cover": false, "watch_dirs": ["$B2/videos"] }
+EOF
+W2STATE="$B2/state/vp-publish/watch.json"
+
+run2() { ( cd "$REPO" && VPP_CONFIG="$B2/config.json" XDG_STATE_HOME="$B2/state" \
+           "$PY" ./vp-publish watch "$@" ); }
+: > "$FAKE_CALL_LOG"
+
+OUT="$(run2 --once 2>&1)"; rc=$?
+dump "$OUT"
+if [ "$rc" = "2" ]; then ok "没有平台时退出码是 2（可脚本化判断）"
+else bad "退出码应为 2，实际 $rc"; fi
+if echo "$OUT" | grep -q "还没有已登录的平台"; then ok "说清了为什么没动静"
+else bad "提示不清楚"; fi
+expect_quiet "没有平台时不乱发"
+
+if "$PY" - "$W2STATE" <<'PYCHK'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit("状态文件读不出来")
+bad = []
+if d.get("published"):
+    bad.append("published 非空")
+if d.get("baseline_done"):
+    bad.append("baseline_done 已翻（积压老片会失去保护）")
+sys.exit("；".join(bad) if bad else 0)
+PYCHK
+then ok "状态干净：没登记、baseline 未翻（积压老片仍受保护）"
+else bad "状态被污染了"; fi
+
+# 「扫码登录」
+echo '[]' > "$B2/sau/cookies/douyin_测试号.json"
+OUT="$(run2 --once 2>&1)"; dump "$OUT"
+if echo "$OUT" | grep -q "目标平台（1）"; then ok "登录被自动发现（没重启服务）"
+else bad "没发现新登录的平台"; fi
+expect_quiet "登录后的第一次扫描只登记，不发"
+
+OUT="$(run2 --once 2>&1)"; dump "$OUT"
+if echo "$OUT" | grep -q "跳过库存"; then ok "积压老片被正确保护"
+else bad "积压老片没被保护（登录后就把它发出去了）"; fi
+expect_quiet "积压老片没被发出去"
+
+head -c 200000 /dev/urandom > "$B2/videos/2026-09-27-登录后新片.mp4"
+run2 --once >/dev/null 2>&1
+OUT="$(run2 --once 2>&1)"; dump "$OUT"
+if echo "$OUT" | grep -q "已发布"; then ok "登录之后的新视频正常发出"
+else bad "新视频没发出去"; fi
+expect_calls 1 "只发了新片（老片没被连带发出）"
+
 echo
 if [ "$FAILED" = 0 ]; then
   printf '\033[1;32m全部通过\033[0m\n'

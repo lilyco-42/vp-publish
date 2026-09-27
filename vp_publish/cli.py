@@ -264,12 +264,20 @@ def publish_one_video(video: Path, cfg: config_mod.Config, *,
                       targets: list[str], available: dict[str, list[str]],
                       sau_path: Path | None, opts: Options,
                       store: state.Store) -> dict:
-    """发布一个视频到所有目标平台。返回 {rows, statuses, results, ok}。
+    """发布一个视频到所有目标平台。返回 {rows, statuses, results, attempted, ok}。
 
     这是「发一个视频」的唯一实现。cmd_publish（一次多个视频）和
     cmd_watch（守护式）都调它 —— 保证两条路径的行为**完全一致**，
     不会出现「手动发成功、自动发失败」这种诡异差异。
+
+    `attempted` 是**真的被尝试过的平台数**（不含「已经发过」被跳过的）。
+    调用方必须看它：目标为空时 `ok` 是 False，绝不能因为「没有失败」
+    就把视频记成已发布 —— 那会让它被永久跳过。
     """
+    if not targets:
+        return {"rows": [], "statuses": [], "results": [], "attempted": 0,
+                "ok": False, "reason": "没有可发的平台"}
+
     m = meta_mod.load(
         video,
         title=opts.title, desc=opts.desc, tags=opts.tags,
@@ -374,7 +382,7 @@ def publish_one_video(video: Path, cfg: config_mod.Config, *,
         store.put(video, record)
 
     return {"rows": rows, "statuses": statuses, "results": results,
-            "ok": not any_fail}
+            "attempted": len(results), "ok": not any_fail}
 
 
 def cmd_publish(args, cfg: config_mod.Config) -> int:
@@ -482,13 +490,6 @@ def cmd_watch(args, cfg: config_mod.Config) -> int:
     if sau_path is None:
         die(sau.sau_problem(cfg))
 
-    available = sau.discover_accounts(cfg)
-    targets, notes = resolve_targets(cfg, args.only, args.skip, available)
-    if not targets:
-        die("没有可发的平台 —— 守护起来也没用。\n"
-            f"  已登录：{', '.join(available) or '（一个都没有）'}\n"
-            "  先登录：vp-publish login douyin")
-
     opts = Options(
         account=args.account, force=False, dry_run=args.dry_run,
         headed=args.headed, quiet=True, schedule=args.schedule,
@@ -513,12 +514,8 @@ def cmd_watch(args, cfg: config_mod.Config) -> int:
 
     log(f"vp-publish watch 启动")
     log(f"  监视目录：{'、'.join(str(d) for d in dirs)}")
-    log(f"  目标平台（{len(targets)}）：" +
-        "、".join(platforms.BY_KEY[t].label for t in targets))
     log(f"  轮询间隔：{args.interval}s")
     log(f"  状态文件：{wstore.path}")
-    for n in notes:
-        log(f"  · {n}")
     if args.dry_run:
         log("  · dry-run 模式：只打印要执行什么，不真发（也不会写发布记录）")
     if not args.publish_backlog and not wstore.state.baseline_done:
@@ -526,8 +523,47 @@ def cmd_watch(args, cfg: config_mod.Config) -> int:
     log("")
 
     round_no = 0
+    last_targets: list[str] | None = None
+    idle_rounds = 0
     while True:
         round_no += 1
+
+        # 每轮重新探测「现在能发哪些平台」。
+        #
+        # 为什么不只在启动时探一次：这是个常驻服务，你不该为了「刚扫码登录
+        # 完」去重启它。更要紧的是 —— 如果启动时一个平台都没登录就退出，
+        # systemd 的 Restart=always 会把它变成重启死循环（cookie 全过期时
+        # 同样会循环）。所以这里不退出，只是等着。
+        available = sau.discover_accounts(cfg)
+        targets, notes = resolve_targets(cfg, args.only, args.skip, available)
+        if targets != last_targets:
+            if targets:
+                log(f"  目标平台（{len(targets)}）：" +
+                    "、".join(platforms.BY_KEY[t].label for t in targets))
+            else:
+                log(f"  ⚠ 还没有已登录的平台，先等着 —— 登录后会自动开始发，"
+                    f"不用重启（vp-publish login douyin）")
+            for n in notes:
+                log(f"  · {n}")
+            last_targets = targets
+
+        if not targets:
+            # 不发任何东西，**也不登记任何文件**。
+            #
+            # 关键：baseline_done 保持 False，所以等第一个平台登录进来、
+            # 第一次真正扫描时，那一刻目录里已有的视频统统算「库存」被跳过。
+            # 这正是我们想要的 —— 服务先上线、后登录，不该把积压的老视频
+            # 一次性发出去。
+            idle_rounds += 1
+            if idle_rounds == 1 or idle_rounds % 20 == 0:
+                log(f"[{time.strftime('%F %T')}] 空转第 {idle_rounds} 轮："
+                    f"没有已登录的平台")
+            if args.once:
+                return 2
+            time.sleep(max(1, args.interval))
+            continue
+        idle_rounds = 0
+
         first_round = not wstore.state.baseline_done
         try:
             videos = watch.scan(dirs, recursive=not args.no_recursive)
@@ -589,6 +625,14 @@ def cmd_watch(args, cfg: config_mod.Config) -> int:
                 # 试运行必须能看见「到底要执行什么」，否则等于没试
                 for res in out["results"]:
                     log(f"      $ {' '.join(res['argv'])}")
+
+            if not out["statuses"]:
+                # 兜底：一个平台都没被处理过。绝不能记成「已发布」——
+                # 那会让这条视频被永久跳过，而且毫无痕迹。
+                skipped += 1
+                log(f"    没有平台可尝试，不记状态：{video.name}")
+                continue
+
             if out["ok"]:
                 published += 1
                 if not args.dry_run:
