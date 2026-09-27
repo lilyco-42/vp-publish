@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -180,6 +181,44 @@ def _env(cfg: Config) -> dict[str, str]:
     return env
 
 
+def run_stream(argv: list[str], cfg: Config, *, cwd: Path | None = None,
+               timeout: int | None = None) -> RunResult:
+    """跑一条命令，**输出直接透传到用户的终端**。
+
+    为什么登录必须用这个而不是 run()：
+    sau 登录时会把二维码用 Unicode 方块字符**打印到 stdout**（见
+    sau 的 utils/login_qrcode.py: print_terminal_qrcode）。
+    如果这里用 capture_output=True，二维码就被吞进变量里了，
+    用户在终端上什么都看不到，只能干等超时——这是实测踩到的坑。
+
+    代价是拿不到输出文本，所以成功与否靠退出码判断。
+    """
+    import time
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd or cfg.sau.root),
+            env=_env(cfg),
+            timeout=timeout or cfg.timeout,
+            # 关键：不捕获，让子进程直接用当前终端
+            stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+        )
+    except subprocess.TimeoutExpired:
+        return RunResult(ok=False, code=-9, argv=argv,
+                         elapsed=time.time() - started,
+                         reason=f"超时（{timeout or cfg.timeout}s）")
+    except FileNotFoundError as exc:
+        return RunResult(ok=False, code=-2, argv=argv,
+                         elapsed=time.time() - started, reason=f"执行失败：{exc}")
+    except Exception as exc:                       # pragma: no cover - 环境相关
+        return RunResult(ok=False, code=-1, argv=argv,
+                         elapsed=time.time() - started, reason=f"异常：{exc}")
+
+    return RunResult(ok=proc.returncode == 0, code=proc.returncode,
+                     argv=argv, elapsed=time.time() - started)
+
+
 def run(argv: list[str], cfg: Config, *, cwd: Path | None = None,
         timeout: int | None = None) -> RunResult:
     import time
@@ -239,30 +278,53 @@ def check(sau: Path, plat_key: str, account: str, cfg: Config,
 
 def login(sau: Path, plat_key: str, account: str, cfg: Config,
           *, headless: bool = True) -> RunResult:
-    # 登录要人扫码/输账号，给足时间
-    return run(build_login_argv(sau, plat_key, account, headless=headless),
-               cfg, timeout=max(cfg.timeout, 900))
+    # 登录要人扫码/输账号，给足时间；且必须用 run_stream 让二维码透传到终端
+    return run_stream(build_login_argv(sau, plat_key, account, headless=headless),
+                      cfg, timeout=max(cfg.timeout, 900))
 
 
-def login_qr_candidates(cfg: Config) -> list[Path]:
-    """登录过程可能产出的二维码图片位置（sau 会写在 cwd 或 cookies 目录）。"""
-    return [
-        cfg.sau.root / "qrcode.png",
-        Path.cwd() / "qrcode.png",
-        cfg.sau.root / "cookies" / "qrcode.png",
-        Path("/tmp/qrcode.png"),
+def qr_glob(cfg: Config, plat_key: str, account: str) -> str:
+    """sau 保存二维码的实际命名规则。
+
+    来自 sau 的 utils/login_qrcode.py:
+        build_login_qrcode_path(account_file) ->
+            {account_file 同目录}/{stem}_login_qrcode_{YYYYmmdd_HHMMSS}.png
+    其中 account_file = {BASE_DIR}/cookies/{platform}_{account}.json
+
+    → 所以真实路径是 cookies/{platform}_{account}_login_qrcode_*.png
+    注意是**带时间戳**的：重试一次会多一个文件，所以要用 glob 取最新的。
+    """
+    return str(cfg.sau.cookies_dir / f"{plat_key}_{account}_login_qrcode_*.png")
+
+
+def newest_qr(cfg: Config, plat_key: str, account: str, since: float) -> Path | None:
+    """找出本次登录生成的二维码图片（最新的那个）。
+
+    顺带兼容几种历史/其他平台的落盘位置，免得 sau 改路径就找不到。
+    """
+    import glob as _glob
+
+    patterns = [
+        qr_glob(cfg, plat_key, account),          # 主路径（实测确认）
+        str(cfg.sau.cookies_dir / "*.png"),       # 兜底：cookies 下任何 png
+        str(cfg.sau.root / "qrcode.png"),         # 文档提到的老位置
+        str(Path.cwd() / "qrcode.png"),
+        "/tmp/qrcode.png",
     ]
-
-
-def newest_qr(cfg: Config, since: float) -> Path | None:
-    """找出登录期间新生成的二维码图片。"""
     best: tuple[float, Path] | None = None
-    for cand in login_qr_candidates(cfg):
-        try:
-            mtime = cand.stat().st_mtime
-        except OSError:
-            continue
-        if mtime >= since - 2:
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for name in _glob.glob(pattern):
+            cand = Path(name)
+            if cand in seen:
+                continue
+            seen.add(cand)
+            try:
+                mtime = cand.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < since - 2:                 # 只认本次登录产生的
+                continue
             if best is None or mtime > best[0]:
                 best = (mtime, cand)
     return best[1] if best else None

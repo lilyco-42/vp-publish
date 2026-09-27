@@ -295,6 +295,72 @@ class TestAccounts(unittest.TestCase):
         self.assertEqual(sau.discover_accounts(cfg), {})
 
 
+class TestLoginQrPath(unittest.TestCase):
+    """二维码路径是实测踩出来的坑，加测试防回归。
+
+    sau 的 utils/login_qrcode.py: build_login_qrcode_path() 生成的是
+        {cookies}/{platform}_{account}_login_qrcode_{YYYYmmdd_HHMMSS}.png
+    早期版本我们去找 cookies/qrcode.png，永远找不到。
+    """
+
+    def test_glob_matches_sau_naming(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(sau=SauConfig(root=Path(tmp)))
+            cookies = cfg.sau.cookies_dir
+            cookies.mkdir()
+            # 模拟 sau 生成的文件（带时间戳）
+            (cookies / "douyin_我的抖音_login_qrcode_20260927_131500.png").write_bytes(b"x")
+            (cookies / "douyin_我的抖音.json").write_text("{}", encoding="utf-8")
+
+            pattern = sau.qr_glob(cfg, "douyin", "我的抖音")
+            import glob
+            hits = glob.glob(pattern)
+            self.assertEqual(len(hits), 1)
+            self.assertIn("login_qrcode_20260927_131500", hits[0])
+
+    def test_newest_qr_picks_latest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(sau=SauConfig(root=Path(tmp)))
+            cookies = cfg.sau.cookies_dir
+            cookies.mkdir()
+            old = cookies / "douyin_a_login_qrcode_20260927_120000.png"
+            new = cookies / "douyin_a_login_qrcode_20260927_131500.png"
+            old.write_bytes(b"old")
+            new.write_bytes(b"new")
+            os.utime(old, (time.time() - 3600, time.time() - 3600))
+            os.utime(new, (time.time(), time.time()))
+
+            got = sau.newest_qr(cfg, "douyin", "a", since=time.time() - 60)
+            self.assertIsNotNone(got)
+            self.assertEqual(got.name, new.name)
+
+    def test_newest_qr_ignores_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(sau=SauConfig(root=Path(tmp)))
+            cookies = cfg.sau.cookies_dir
+            cookies.mkdir()
+            stale = cookies / "douyin_a_login_qrcode_20260927_120000.png"
+            stale.write_bytes(b"old")
+            os.utime(stale, (time.time() - 3600, time.time() - 3600))
+            # since 是刚才 → 一小时前的文件不算本次生成的
+            self.assertIsNone(sau.newest_qr(cfg, "douyin", "a", since=time.time() - 60))
+
+    def test_newest_qr_none_when_no_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(sau=SauConfig(root=Path(tmp)))
+            self.assertIsNone(sau.newest_qr(cfg, "douyin", "a", since=0))
+
+    def test_login_uses_stream_not_capture(self):
+        """登录必须透传输出，否则终端上的二维码会被吞掉。
+
+        这条用源码检查来守——因为「有没有捕获输出」很难用行为测。
+        """
+        import inspect
+        src = inspect.getsource(sau.login)
+        self.assertIn("run_stream", src)
+        self.assertNotIn("run(", src.replace("run_stream(", ""))
+
+
 # ── 封面 ────────────────────────────────────────────────────────
 class TestCover(unittest.TestCase):
     def test_crop_wider_source(self):

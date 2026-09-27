@@ -418,39 +418,53 @@ def cmd_login(args, cfg: config_mod.Config) -> int:
     account = args.account or cfg.sau.accounts.get(key) or \
         (available.get(key) or [""])[0] or f"我的{plat.label}"
 
+    acct_file = sau.account_file(cfg, key, account)
+    before = acct_file.stat().st_mtime if acct_file.is_file() else 0.0
+
     say(f"登录 {plat.label}（{key}），账号名：{account}")
     say(f"  方式：{'浏览器里输账号' if plat.login == 'browser' else '手机扫码'}")
     if plat.login == "browser" and not args.headed:
         say("  · 这个平台要在浏览器里操作，建议加 --headed 看得到窗口")
-    say("  · 二维码/窗口出现后请尽快操作；超时或失败会打印原因")
+    say("  · sau 会把二维码直接打印在下面（没有的话看最后打印的图片路径）")
     say()
 
     since = time.time()
     headless = not args.headed
+    # 注意：这一步的输出**直接透传到你的终端**（含二维码），不经过我们捕获。
+    # 见 sau.run_stream() 的注释 —— 早期版本捕获了输出，二维码被吞掉，
+    # 用户在终端上什么都看不到，只能干等超时。
     res = sau.login(sau_path, key, account, cfg, headless=headless)
 
-    qr = sau.newest_qr(cfg, since)
+    # 成功判据：账号文件被创建/更新（因为输出被透传，拿不到文本）
+    after = acct_file.stat().st_mtime if acct_file.is_file() else 0.0
+    saved = after > before
+
+    qr = sau.newest_qr(cfg, key, account, since)
     if qr:
-        say(f"二维码图片：{qr}")
+        say(f"\n二维码图片：{qr}")
         if args.qr_out:
             try:
-                import shutil
-                shutil.copy2(qr, args.qr_out)
+                import shutil as _shutil
+                _shutil.copy2(qr, args.qr_out)
                 say(f"已另存到：{args.qr_out}")
             except Exception as exc:
                 warn(f"另存二维码失败：{exc}")
 
-    if res.ok:
-        say(f"\n✓ {plat.label} 登录流程完成。")
-        say(f"  账号文件：{sau.account_file(cfg, key, account)}")
+    if res.ok and saved:
+        say(f"\n✓ {plat.label} 登录成功。")
+        say(f"  账号文件：{acct_file}")
         say(f"  验一下：vp-publish doctor --only {key} --live")
         return 0
+
+    if res.ok and not saved:
+        # 退出码 0 但文件没动 —— sau 有时会这样，别报「成功」骗人
+        say(f"\n? {plat.label} 登录流程跑完了，但账号文件没变化（{acct_file}）。")
+        say("  可能你中途取消/超时了。重跑一次，并加上 --headed 看清过程。")
+        return 1
 
     say(f"\n✗ {plat.label} 登录失败。")
     if res.reason:
         say(f"  原因：{res.reason}")
-    if res.tail:
-        say(f"  输出：{res.tail}")
     say("  提示：加 --headed 看得到浏览器窗口，最容易定位问题")
     return 1
 
