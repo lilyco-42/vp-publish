@@ -837,6 +837,25 @@ sau 升级了也不连累它。
     **先证伪「是我改坏的」，再去找真原因** —— 否则会去修一个不存在的问题，
     还会把本来正确的代码改错。
 
+41. **`--dry-run` 不能把「组不出命令」报成「试运行」**。
+    原来 `publish_one_video` 里是 `if opts.dry_run: status = DRY` ——
+    **无条件**覆盖，完全没看 `res.ok`。
+
+    这个 bug 藏得很深，因为它**被另一个错误掩盖着**：
+    以前 `build_upload_argv(None, ...)` 会吐出
+    `None douyin upload-video ...` 这种假 argv（非空、但是错的），
+    所以那一行看起来「有东西」，不像坏了。等 TikTok 那次改动让
+    `upload()` 在缺后端时返回 `ok=False`，它才露出真面目 ——
+    一行**空白** + 绿字「试运行」。
+
+    实测场景：配置里 `sau.bin` 指错路径，11 个平台里 10 个报「试运行」
+    而 argv 是空的。而 `--dry-run` 的**全部意义**就是「先看看会执行什么」——
+    连命令都组不出来还说试运行，那是骗人。
+
+    修完还顺带证明了解耦是真的：同一个「找不到 sau」的配置下，
+    10 个 CLI 平台如实报 `✗ 失败`，**TikTok 照样 `~ 试运行`**
+    （它只要解释器在，压根不碰那个可执行文件）。
+
 ---
 
 ## 目录结构
@@ -862,7 +881,7 @@ vp-publish/
 │   ├── config.py              # 配置（零依赖 JSON）
 │   └── report.py              # 表格渲染（含中文宽度）
 └── tests/
-    ├── test_vp_publish.py     # 129 项单元测试
+    ├── test_vp_publish.py     # 131 项单元测试
     ├── e2e_watch.sh           # watch 跨轮行为演练（假 sau）
     ├── e2e_loginweb.sh        # 扫码网页演练（真 HTTP + 真 PNG）
     ├── reach_probe.py         # 实测各平台可达性
@@ -874,7 +893,7 @@ vp-publish/
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v   # 129 项单元测试
+python3 -m unittest discover -s tests -v   # 131 项单元测试
 bash tests/e2e_watch.sh                    # watch 跨轮行为演练（假 sau，几秒跑完）
 bash tests/e2e_loginweb.sh                 # 扫码网页演练（真起 HTTP 服务，约半分钟）
 ```

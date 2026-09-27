@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vp-publish"
-version = "0.5.0"
+version = "0.5.1"
 description = "一键上传视频到各个平台（抖音/小红书/快手/B站/视频号/微博/虎扑/百家号/支付宝/YouTube/TikTok）"
 readme = "README.md"
 requires-python = ">=3.10"

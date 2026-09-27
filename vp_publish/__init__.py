@@ -16,4 +16,4 @@ sau 的命令行里没有 TikTok（上游只写了 `uploader/tk_uploader/`，没
 所以那一个平台由本工具自带的驱动脚本代跑 —— 见 `tk_driver.py`。
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
