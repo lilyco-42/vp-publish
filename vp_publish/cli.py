@@ -519,7 +519,7 @@ def cmd_watch(args, cfg: config_mod.Config) -> int:
     if args.dry_run:
         log("  · dry-run 模式：只打印要执行什么，不真发（也不会写发布记录）")
     if not args.publish_backlog and not wstore.state.baseline_done:
-        log("  · 首次启动：已存在的视频只登记、不发布（要发库存加 --publish-backlog）")
+        log("  · 已有视频只登记、不发布（要发库存加 --publish-backlog）")
     log("")
 
     round_no = 0
@@ -548,16 +548,31 @@ def cmd_watch(args, cfg: config_mod.Config) -> int:
             last_targets = targets
 
         if not targets:
-            # 不发任何东西，**也不登记任何文件**。
+            # 不发任何东西，但**照常登记**，而且登记成「库存」。
             #
-            # 关键：baseline_done 保持 False，所以等第一个平台登录进来、
-            # 第一次真正扫描时，那一刻目录里已有的视频统统算「库存」被跳过。
-            # 这正是我们想要的 —— 服务先上线、后登录，不该把积压的老视频
-            # 一次性发出去。
+            # 为什么必须登记：这些文件出现在「还没有能力发布」的期间。
+            # 如果放着不管，等你几天后想起来登录，它们会被当成「新视频」
+            # 一次性全发出去 —— 一天 4 条 × 10 个平台，几百次上传，
+            # 平台侧大概率直接判风控。而漏发是可恢复的
+            # （--publish-backlog 补发，或 forget 后重发），误发不可逆。
+            #
+            # baseline_done 保持 False 也有意义：它保证「第一次真正有能力
+            # 发布的扫描」那一刻目录里已有的东西都算库存。
             idle_rounds += 1
+            try:
+                waiting = watch.scan(dirs, recursive=not args.no_recursive)
+            except Exception:                       # pragma: no cover - 环境相关
+                waiting = []
+            for video in waiting:
+                watch.register(wstore.state, video, baseline=True)
             if idle_rounds == 1 or idle_rounds % 20 == 0:
+                extra = (f"，已登记 {len(waiting)} 个视频"
+                         f"（登录后按库存跳过，要发加 --publish-backlog）"
+                         if waiting else "")
                 log(f"[{time.strftime('%F %T')}] 空转第 {idle_rounds} 轮："
-                    f"没有已登录的平台")
+                    f"没有已登录的平台{extra}")
+            if not args.dry_run:
+                wstore.save()
             if args.once:
                 return 2
             time.sleep(max(1, args.interval))
@@ -602,7 +617,7 @@ def cmd_watch(args, cfg: config_mod.Config) -> int:
                     wstore.state.published[key] = \
                         f"baseline-skip@{time.strftime('%F %T')}"
                 skipped += 1
-                log(f"  跳过库存：{video.name}（启动时已存在，未发布）")
+                log(f"  跳过库存：{video.name}（第一次能发布时它就在了，未发布）")
                 continue
 
             log(f"  发布：{video.name}")

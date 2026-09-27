@@ -182,21 +182,26 @@ if echo "$OUT" | grep -q "还没有已登录的平台"; then ok "说清了为什
 else bad "提示不清楚"; fi
 expect_quiet "没有平台时不乱发"
 
-if "$PY" - "$W2STATE" <<'PYCHK'
-import json, sys
+if "$PY" - "$W2STATE" "$B2/videos/2026-09-01-积压老片.mp4" <<'PYCHK'
+import json, os, sys
 try:
     d = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
     sys.exit("状态文件读不出来")
 bad = []
 if d.get("published"):
-    bad.append("published 非空")
+    bad.append("published 非空（还没平台就记成已发了）")
 if d.get("baseline_done"):
     bad.append("baseline_done 已翻（积压老片会失去保护）")
+key = os.path.realpath(sys.argv[2])
+seen = d.get("seen") or {}
+if not (seen.get(key) or {}).get("baseline"):
+    bad.append("空转期间没把文件登记成库存"
+               "（登录后会被当成新视频，一次全发出去）")
 sys.exit("；".join(bad) if bad else 0)
 PYCHK
-then ok "状态干净：没登记、baseline 未翻（积压老片仍受保护）"
-else bad "状态被污染了"; fi
+then ok "空转期间：登记为库存、baseline 未翻、published 为空"
+else bad "空转期间的状态不对"; fi
 
 # 「扫码登录」
 echo '[]' > "$B2/sau/cookies/douyin_测试号.json"
