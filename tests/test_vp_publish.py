@@ -1053,6 +1053,45 @@ class TestDriverDispatch(unittest.TestCase):
         self.assertTrue(res.ok)
         self.assertNotIn("upload-video", res.argv)   # 那是 sau CLI 的子命令名
 
+    def test_dry_run_never_hides_a_missing_backend(self):
+        """**dry-run 也不能把「组不出命令」报成「试运行」。**
+
+        实测踩到的：配置里 `sau.bin` 指错了路径，于是 11 个平台里
+        10 个显示「试运行」，而 argv 那一行只剩一个 `$`（空的）——
+        看着全绿，其实一个命令都没组出来。
+
+        原因是原来这里写着 `if opts.dry_run: status = DRY`，
+        **无条件**覆盖，完全没看 `res.ok`。
+        而 dry-run 的全部意义就是「先看看会执行什么」：
+        连命令都组不出来还说试运行，那是骗人。
+        """
+        from vp_publish import cli
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("XDG_STATE_HOME")
+            os.environ["XDG_STATE_HOME"] = tmp
+            try:
+                cfg = Config(sau=SauConfig(root=Path(tmp),
+                                           bin=Path(tmp) / "no-such-sau",
+                                           python=Path(tmp) / "nope"),
+                             cover=False)
+                with unittest.mock.patch.object(sau.shutil, "which",
+                                                return_value=None):
+                    out = cli.publish_one_video(
+                        Path(tmp) / "v.mp4", cfg, targets=["douyin"],
+                        available={"douyin": ["acct"]}, sau_path=None,
+                        opts=cli.Options(dry_run=True, quiet=True, no_cover=True),
+                        store=state.Store())
+            finally:
+                if old is None:
+                    os.environ.pop("XDG_STATE_HOME", None)
+                else:
+                    os.environ["XDG_STATE_HOME"] = old
+
+        self.assertEqual(out["statuses"], [report.FAIL],
+                         "组不出命令却报成「试运行」—— 那是假绿")
+        self.assertFalse(out["ok"])
+        self.assertIn("sau", out["results"][0]["note"])
+
 
 # ── 配置 ────────────────────────────────────────────────────────
 class TestConfig(unittest.TestCase):

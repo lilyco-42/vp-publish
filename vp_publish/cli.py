@@ -360,14 +360,20 @@ def publish_one_video(video: Path, cfg: config_mod.Config, *,
         res = sau.upload(sau_path, plat, account, video, use, covers, cfg,
                          headless=headless, dry_run=opts.dry_run)
 
-        if opts.dry_run:
-            status, note = report.DRY, ""
-        elif res.ok:
-            status, note = report.OK, ""
-        else:
+        # 注意 dry_run 也要看 res.ok。
+        # 原来这里是无条件 `if opts.dry_run: status = DRY` —— 结果是
+        # 「连命令都组不出来」也会被报成「试运行」，还附一行空白 argv。
+        # 而 dry-run 的**全部意义**就是「先看看会执行什么」：
+        # 组不出命令还说试运行，那是骗人（实测踩到：配置里 sau.bin 指错了
+        # 路径，11 个平台里 10 个显示「试运行」而 argv 是空的）。
+        if not res.ok:
             status = report.FAIL
             note = res.reason or res.tail or f"退出码 {res.code}"
             any_fail = True
+        elif opts.dry_run:
+            status, note = report.DRY, ""
+        else:
+            status, note = report.OK, ""
 
         if not opts.dry_run:
             record.mark(key, state.OK if res.ok else state.FAIL, note=note[:200])
